@@ -46,6 +46,9 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/app/libs"
           cp -v libv2ray.aar "$GITHUB_WORKSPACE/app/libs/libv2ray.aar"
 
+      - name: Apply Bridge source enhancements
+        run: python3 tools/patch_main_activity.py
+
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon
 
