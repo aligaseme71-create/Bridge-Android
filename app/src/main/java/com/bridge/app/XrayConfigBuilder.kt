@@ -10,14 +10,13 @@ object XrayConfigBuilder {
     fun build(uri: String): String {
         val clean = uri.trim()
         val outbound = when {
-            clean.startsWith("vless://", true) -> vless(clean)
-            clean.startsWith("vmess://", true) -> vmess(clean)
-            clean.startsWith("trojan://", true) -> trojan(clean)
-            clean.startsWith("ss://", true) -> shadowsocks(clean)
+            clean.startsWith("vless://", true) -> buildVless(clean)
+            clean.startsWith("vmess://", true) -> buildVmess(clean)
+            clean.startsWith("trojan://", true) -> buildTrojan(clean)
+            clean.startsWith("ss://", true) -> buildShadowsocks(clean)
             else -> throw IllegalArgumentException("Unsupported profile")
         }
-        val config = JSONObject()
-        config.put("log", JSONObject().put("loglevel", "warning"))
+
         val tun = JSONObject()
             .put("tag", "tun")
             .put("port", 0)
@@ -27,101 +26,104 @@ object XrayConfigBuilder {
                 .put("enabled", true)
                 .put("routeOnly", false)
                 .put("destOverride", JSONArray().put("http").put("tls").put("quic")))
-        config.put("inbounds", JSONArray().put(tun))
-        config.put("outbounds", JSONArray()
-            .put(outbound.put("tag", "proxy"))
-            .put(JSONObject().put("tag", "direct").put("protocol", "freedom"))
-            .put(JSONObject().put("tag", "block").put("protocol", "blackhole")))
-        config.put("routing", JSONObject()
-            .put("domainStrategy", "IPIfNonMatch")
-            .put("rules", JSONArray().put(JSONObject()
-                .put("type", "field")
-                .put("inboundTag", JSONArray().put("tun"))
-                .put("outboundTag", "proxy"))))
+
+        val config = JSONObject()
+            .put("log", JSONObject().put("loglevel", "warning"))
+            .put("inbounds", JSONArray().put(tun))
+            .put("outbounds", JSONArray()
+                .put(outbound.put("tag", "proxy"))
+                .put(JSONObject().put("tag", "direct").put("protocol", "freedom"))
+                .put(JSONObject().put("tag", "block").put("protocol", "blackhole")))
+            .put("routing", JSONObject()
+                .put("domainStrategy", "IPIfNonMatch")
+                .put("rules", JSONArray().put(JSONObject()
+                    .put("type", "field")
+                    .put("inboundTag", JSONArray().put("tun"))
+                    .put("outboundTag", "proxy"))))
         return config.toString()
     }
 
-    private fun vless(link: String): JSONObject {
+    private fun buildVless(link: String): JSONObject {
         val u = Uri.parse(link)
-        val user = URLDecoder.decode(u.userInfo ?: "", "UTF-8")
-        val address = u.host ?: throw IllegalArgumentException("VLESS host missing")
+        val id = decode(u.userInfo ?: "")
+        val host = u.host ?: throw IllegalArgumentException("VLESS host missing")
         val port = if (u.port > 0) u.port else 443
-        val q = link.queryParameterMap()
-        val userObj = JSONObject().put("id", user).put("encryption", q["encryption"] ?: "none")
-        q["flow"]?.takeIf { it.isNotBlank() }?.let { userObj.put("flow", it) }
-        val vnext = JSONObject().put("address", address).put("port", port).put("users", JSONArray().put(userObj))
-        return JSONObject().put("protocol", "vless").put("settings", JSONObject().put("vnext", JSONArray().put(vnext)))
-            .put("streamSettings", streamSettings(q))
+        val q = query(link)
+        val user = JSONObject().put("id", id).put("encryption", q["encryption"] ?: "none")
+        q["flow"]?.takeIf { it.isNotBlank() }?.let { user.put("flow", it) }
+        val vnext = JSONObject().put("address", host).put("port", port).put("users", JSONArray().put(user))
+        return JSONObject().put("protocol", "vless")
+            .put("settings", JSONObject().put("vnext", JSONArray().put(vnext)))
+            .put("streamSettings", stream(q))
     }
 
-    private fun trojan(link: String): JSONObject {
+    private fun buildTrojan(link: String): JSONObject {
         val u = Uri.parse(link)
-        val password = URLDecoder.decode(u.userInfo ?: "", "UTF-8")
-        val q = link.queryParameterMap()
-        val server = JSONObject().put("address", u.host ?: throw IllegalArgumentException("Trojan host missing"))
-            .put("port", if (u.port > 0) u.port else 443).put("password", password)
-        return JSONObject().put("protocol", "trojan").put("settings", JSONObject().put("servers", JSONArray().put(server)))
-            .put("streamSettings", streamSettings(q))
+        val password = decode(u.userInfo ?: "")
+        val q = query(link)
+        val server = JSONObject()
+            .put("address", u.host ?: throw IllegalArgumentException("Trojan host missing"))
+            .put("port", if (u.port > 0) u.port else 443)
+            .put("password", password)
+        return JSONObject().put("protocol", "trojan")
+            .put("settings", JSONObject().put("servers", JSONArray().put(server)))
+            .put("streamSettings", stream(q))
     }
 
-    private fun vmess(link: String): JSONObject {
-        val encoded = link.substringAfter("vmess://").substringBefore("#")
-        val json = String(Base64.decode(padBase64(encoded), Base64.DEFAULT), Charsets.UTF_8)
-        val src = JSONObject(json)
+    private fun buildVmess(link: String): JSONObject {
+        val encoded = link.substringAfter("vmess://").substringBefore('#')
+        val src = JSONObject(String(Base64.decode(pad(encoded), Base64.DEFAULT), Charsets.UTF_8))
         val address = src.optString("add").ifBlank { src.optString("address") }
+        if (address.isBlank()) throw IllegalArgumentException("VMess host missing")
         val port = src.optInt("port", 443)
-        val user = src.optString("id")
-        val userObj = JSONObject().put("id", user).put("alterId", src.optInt("aid", 0)).put("security", src.optString("scy", "auto"))
-        val out = JSONObject().put("protocol", "vmess").put("settings", JSONObject().put("vnext", JSONArray().put(
-            JSONObject().put("address", address).put("port", port).put("users", JSONArray().put(userObj)))))
+        val user = JSONObject()
+            .put("id", src.optString("id"))
+            .put("alterId", src.optInt("aid", 0))
+            .put("security", src.optString("scy", "auto"))
+        val out = JSONObject().put("protocol", "vmess")
+            .put("settings", JSONObject().put("vnext", JSONArray().put(
+                JSONObject().put("address", address).put("port", port).put("users", JSONArray().put(user)))))
         val q = linkedMapOf<String, String>()
-        src.optString("net").takeIf { it.isNotBlank() }?.let { q["type"] = it }
-        src.optString("host").takeIf { it.isNotBlank() }?.let { q["host"] = it }
-        src.optString("path").takeIf { it.isNotBlank() }?.let { q["path"] = it }
-        src.optString("tls").takeIf { it.isNotBlank() }?.let { q["security"] = if (it == "tls") "tls" else it }
-        src.optString("sni").takeIf { it.isNotBlank() }?.let { q["sni"] = it }
-        src.optString("fp").takeIf { it.isNotBlank() }?.let { q["fp"] = it }
-        src.optString("mode").takeIf { it.isNotBlank() }?.let { q["mode"] = it }
-        src.optString("extra").takeIf { it.isNotBlank() }?.let { q["extra"] = it }
-        return out.put("streamSettings", streamSettings(q))
+        listOf("net" to "type", "host" to "host", "path" to "path", "tls" to "security", "sni" to "sni", "fp" to "fp", "mode" to "mode", "extra" to "extra").forEach { (from, to) ->
+            src.optString(from).takeIf { it.isNotBlank() }?.let { q[to] = if (from == "tls" && it == "tls") "tls" else it }
+        }
+        return out.put("streamSettings", stream(q))
     }
 
-    private fun shadowsocks(link: String): JSONObject {
-        val raw = link.substringAfter("ss://").substringBefore("#")
+    private fun buildShadowsocks(link: String): JSONObject {
+        val raw = link.substringAfter("ss://").substringBefore('#')
         val at = raw.indexOf('@')
         val methodPassword: String
         val hostPort: String
         if (at >= 0) {
-            methodPassword = URLDecoder.decode(raw.substring(0, at), "UTF-8")
+            methodPassword = decode(raw.substring(0, at))
             hostPort = raw.substring(at + 1)
         } else {
-            val decodedFull = String(Base64.decode(padBase64(raw), Base64.DEFAULT), Charsets.UTF_8)
-            val a = decodedFull.lastIndexOf('@')
-            if (a <= 0) throw IllegalArgumentException("Invalid Shadowsocks profile")
-            methodPassword = decodedFull.substring(0, a)
-            hostPort = decodedFull.substring(a + 1)
+            val decoded = String(Base64.decode(pad(raw), Base64.DEFAULT), Charsets.UTF_8)
+            val splitAt = decoded.lastIndexOf('@')
+            if (splitAt <= 0) throw IllegalArgumentException("Invalid Shadowsocks profile")
+            methodPassword = decoded.substring(0, splitAt)
+            hostPort = decoded.substring(splitAt + 1)
         }
         val colon = hostPort.lastIndexOf(':')
         if (colon <= 0) throw IllegalArgumentException("Shadowsocks host missing")
         val host = hostPort.substring(0, colon).trim('[', ']')
         val port = hostPort.substring(colon + 1).toIntOrNull() ?: 443
-        val split = methodPassword.split(':', limit = 2)
-        val server = JSONObject().put("address", host).put("port", port).put("method", split.first()).put("password", split.getOrElse(1) { "" })
-        return JSONObject().put("protocol", "shadowsocks").put("settings", JSONObject().put("servers", JSONArray().put(server)))
+        val pair = methodPassword.split(':', limit = 2)
+        val server = JSONObject().put("address", host).put("port", port)
+            .put("method", pair.first()).put("password", pair.getOrElse(1) { "" })
+        return JSONObject().put("protocol", "shadowsocks")
+            .put("settings", JSONObject().put("servers", JSONArray().put(server)))
     }
 
-    private fun streamSettings(q: Map<String, String>): JSONObject {
-        val network = q["type"] ?: q["network"] ?: "tcp"
-        val security = q["security"] ?: q["tls"] ?: "none"
-        val securityValue = when (security.lowercase()) {
-            "reality" -> "reality"
-            "tls" -> "tls"
-            else -> "none"
-        }
+    private fun stream(q: Map<String, String>): JSONObject {
+        val network = (q["type"] ?: q["network"] ?: "tcp").lowercase()
+        val security = (q["security"] ?: q["tls"] ?: "none").lowercase()
+        val securityValue = if (security == "tls" || security == "reality") security else "none"
         val s = JSONObject().put("network", network).put("security", securityValue)
         val host = q["host"] ?: q["hostHeader"]
         val path = q["path"] ?: "/"
-        when (network.lowercase()) {
+        when (network) {
             "ws" -> {
                 val ws = JSONObject().put("path", decode(path))
                 host?.let { ws.put("headers", JSONObject().put("Host", it)) }
@@ -139,44 +141,47 @@ object XrayConfigBuilder {
                 s.put("httpupgradeSettings", hu)
             }
             "xhttp" -> {
-                val xhttp = JSONObject().put("path", decode(path)).put("mode", q["mode"] ?: "auto")
-                host?.let { xhttp.put("host", it) }
-                q["extra"]?.takeIf { it.isNotBlank() }?.let { raw ->
-                    try { xhttp.put("extra", JSONObject(decode(raw))) } catch (_: Exception) { }
+                val x = JSONObject().put("path", decode(path)).put("mode", q["mode"] ?: "auto")
+                host?.let { x.put("host", it) }
+                q["extra"]?.takeIf { it.isNotBlank() }?.let {
+                    try { x.put("extra", JSONObject(decode(it))) } catch (_: Exception) { }
                 }
-                s.put("xhttpSettings", xhttp)
+                s.put("xhttpSettings", x)
             }
             "tcp" -> if (!host.isNullOrBlank()) {
-                s.put("tcpSettings", JSONObject()
-                    .put("header", JSONObject()
-                        .put("type", "http")
-                        .put("request", JSONObject()
-                            .put("headers", JSONObject().put("Host", JSONArray().put(host)))
-                            .put("path", JSONArray().put(path))))
+                val header = JSONObject().put("type", "http").put("request", JSONObject()
+                    .put("headers", JSONObject().put("Host", JSONArray().put(host)))
+                    .put("path", JSONArray().put(path)))
+                s.put("tcpSettings", JSONObject().put("header", header))
             }
         }
-        when (security.lowercase()) {
-            "tls" -> s.put("tlsSettings", JSONObject().put("serverName", q["sni"] ?: host ?: "").apply {
-                q["fp"]?.let { put("fingerprint", it) }
-                q["alpn"]?.let { put("alpn", JSONArray(it.split(',').filter { v -> v.isNotBlank() })) }
-                put("allowInsecure", q["allowInsecure"] == "1" || q["allowInsecure"] == "true")
-            })
-            "reality" -> s.put("realitySettings", JSONObject()
-                .put("serverName", q["sni"] ?: "")
-                .put("fingerprint", q["fp"] ?: "chrome")
-                .put("publicKey", q["pbk"] ?: q["publicKey"] ?: "")
-                .put("shortId", q["sid"] ?: "")
-                .put("spiderX", decode(q["spx"] ?: "/")))
+        when (security) {
+            "tls" -> {
+                val tls = JSONObject().put("serverName", q["sni"] ?: host ?: "")
+                q["fp"]?.let { tls.put("fingerprint", it) }
+                q["alpn"]?.let { tls.put("alpn", JSONArray(it.split(',').filter(String::isNotBlank))) }
+                tls.put("allowInsecure", q["allowInsecure"] == "1" || q["allowInsecure"] == "true")
+                s.put("tlsSettings", tls)
+            }
+            "reality" -> {
+                val reality = JSONObject()
+                    .put("serverName", q["sni"] ?: "")
+                    .put("fingerprint", q["fp"] ?: "chrome")
+                    .put("publicKey", q["pbk"] ?: q["publicKey"] ?: "")
+                    .put("shortId", q["sid"] ?: "")
+                    .put("spiderX", decode(q["spx"] ?: "/"))
+                s.put("realitySettings", reality)
+            }
         }
         return s
     }
 
-    private fun decode(v: String): String = try { URLDecoder.decode(v, "UTF-8") } catch (_: Exception) { v }
-
-    private fun padBase64(v: String): String = v + "=".repeat((4 - v.length % 4) % 4)
-
-    private fun String.queryParameterMap(): Map<String, String> {
-        val parsed = Uri.parse(this)
-        return parsed.queryParameterNames.associateWith { parsed.getQueryParameter(it).orEmpty() }
+    private fun query(link: String): Map<String, String> {
+        val u = Uri.parse(link)
+        return u.queryParameterNames.associateWith { u.getQueryParameter(it).orEmpty() }
     }
+
+    private fun decode(value: String): String = try { URLDecoder.decode(value, "UTF-8") } catch (_: Exception) { value }
+
+    private fun pad(value: String): String = value + "=".repeat((4 - value.length % 4) % 4)
 }
