@@ -40,7 +40,7 @@ object XrayConfigBuilder {
         val user = URLDecoder.decode(u.userInfo ?: "", "UTF-8")
         val address = u.host ?: throw IllegalArgumentException("VLESS host missing")
         val port = if (u.port > 0) u.port else 443
-        val q = u.queryParameterMap()
+        val q = link.queryParameterMap()
         val userObj = JSONObject().put("id", user).put("encryption", q["encryption"] ?: "none")
         q["flow"]?.takeIf { it.isNotBlank() }?.let { userObj.put("flow", it) }
         val vnext = JSONObject().put("address", address).put("port", port).put("users", JSONArray().put(userObj))
@@ -52,7 +52,7 @@ object XrayConfigBuilder {
     private fun trojan(link: String): JSONObject {
         val u = Uri.parse(link)
         val password = URLDecoder.decode(u.userInfo ?: "", "UTF-8")
-        val q = u.queryParameterMap()
+        val q = link.queryParameterMap()
         val server = JSONObject().put("address", u.host ?: throw IllegalArgumentException("Trojan host missing"))
             .put("port", if (u.port > 0) u.port else 443).put("password", password)
         val out = JSONObject().put("protocol", "trojan").put("settings", JSONObject().put("servers", JSONArray().put(server)))
@@ -83,7 +83,6 @@ object XrayConfigBuilder {
 
     private fun shadowsocks(link: String): JSONObject {
         val raw = link.substringAfter("ss://").substringBefore("#")
-        val decoded = try { String(Base64.decode(padBase64(raw.substringBefore('@')), Base64.DEFAULT), Charsets.UTF_8) } catch (_: Exception) { "" }
         val at = raw.indexOf('@')
         val methodPassword: String
         val hostPort: String
@@ -93,10 +92,12 @@ object XrayConfigBuilder {
         } else {
             val decodedFull = String(Base64.decode(padBase64(raw), Base64.DEFAULT), Charsets.UTF_8)
             val a = decodedFull.lastIndexOf('@')
+            if (a <= 0) throw IllegalArgumentException("Invalid Shadowsocks profile")
             methodPassword = decodedFull.substring(0, a)
             hostPort = decodedFull.substring(a + 1)
         }
         val colon = hostPort.lastIndexOf(':')
+        if (colon <= 0) throw IllegalArgumentException("Shadowsocks host missing")
         val host = hostPort.substring(0, colon).trim('[', ']')
         val port = hostPort.substring(colon + 1).toIntOrNull() ?: 443
         val split = methodPassword.split(':', limit = 2)
@@ -132,8 +133,7 @@ object XrayConfigBuilder {
     private fun padBase64(v: String): String = v + "=".repeat((4 - v.length % 4) % 4)
 
     private fun String.queryParameterMap(): Map<String, String> {
-        val result = linkedMapOf<String, String>()
-        Uri.parse(this).queryParameterNames.forEach { key -> result[key] = Uri.parse(this).getQueryParameter(key).orEmpty() }
-        return result
+        val parsed = Uri.parse(this)
+        return parsed.queryParameterNames.associateWith { parsed.getQueryParameter(it).orEmpty() }
     }
 }
