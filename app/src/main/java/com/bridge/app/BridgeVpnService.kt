@@ -32,6 +32,7 @@ class BridgeVpnService : VpnService() {
 
     private var vpnInterface: android.os.ParcelFileDescriptor? = null
     private var controller: CoreController? = null
+    private var coreInitialized = false
 
     private val callback = object : CoreCallbackHandler {
         override fun startup(): Long {
@@ -53,12 +54,21 @@ class BridgeVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         createChannel()
+        initializeCore()
+    }
+
+    private fun initializeCore() {
+        if (coreInitialized && controller != null) return
         try {
             Seq.setContext(applicationContext)
             Libv2ray.initCoreEnv(filesDir.absolutePath, "bridge")
             controller = Libv2ray.newCoreController(callback)
+            coreInitialized = true
+            BridgeVpnState.message = "Core ready"
         } catch (e: Exception) {
-            BridgeVpnState.message = "Core init failed: ${e.message}"
+            coreInitialized = false
+            controller = null
+            BridgeVpnState.message = "Core init failed: ${e.message ?: e.javaClass.simpleName}"
             Log.e("BridgeVPN", "Core init failed", e)
         }
     }
@@ -77,6 +87,14 @@ class BridgeVpnService : VpnService() {
             return
         }
         stopTunnel(false)
+        initializeCore()
+        val core = controller
+        if (core == null) {
+            BridgeVpnState.connected = false
+            BridgeVpnState.message = "VPN core is not available"
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            return
+        }
         try {
             startForeground(NOTIFICATION_ID, notification("Bridge is connecting"))
             val config = XrayConfigBuilder.build(uri)
@@ -85,8 +103,6 @@ class BridgeVpnService : VpnService() {
                 .setMtu(1500)
                 .addAddress("10.7.0.2", 32)
                 .addRoute("0.0.0.0", 0)
-                .addAddress("fd00:7::2", 128)
-                .addRoute("::", 0)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
                 .apply {
@@ -97,16 +113,17 @@ class BridgeVpnService : VpnService() {
                 }
                 .establish()
             val pfd = vpnInterface ?: throw IllegalStateException("Android did not create the VPN interface")
-            controller?.startLoop(config, pfd.fd)
-            if (controller?.isRunning != true) throw IllegalStateException("Xray core did not start")
+            core.startLoop(config, pfd.fd)
+            if (!core.isRunning) throw IllegalStateException("Xray core did not start")
             BridgeVpnState.connected = true
             BridgeVpnState.message = "Connected"
             updateNotification("Bridge connected")
         } catch (e: Exception) {
             Log.e("BridgeVPN", "Start failed", e)
             BridgeVpnState.connected = false
-            BridgeVpnState.message = "Connection failed: ${e.message ?: "unknown error"}"
-            vpnInterface?.close()
+            BridgeVpnState.message = "Connection failed: ${e.message ?: e.javaClass.simpleName}"
+            try { core.stopLoop() } catch (_: Exception) { }
+            try { vpnInterface?.close() } catch (_: Exception) { }
             vpnInterface = null
             stopForeground(STOP_FOREGROUND_REMOVE)
         }
@@ -130,6 +147,7 @@ class BridgeVpnService : VpnService() {
     override fun onDestroy() {
         stopTunnel(false)
         controller = null
+        coreInitialized = false
         super.onDestroy()
     }
 
