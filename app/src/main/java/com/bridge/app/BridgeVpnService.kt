@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.IBinder
@@ -40,11 +41,13 @@ class BridgeVpnService : VpnService() {
             BridgeVpnState.message = "Connected"
             return 0L
         }
+
         override fun shutdown(): Long {
             BridgeVpnState.connected = false
             BridgeVpnState.message = "Disconnected"
             return 0L
         }
+
         override fun onEmitStatus(code: Long, text: String?): Long {
             if (!text.isNullOrBlank()) BridgeVpnState.message = text
             return 0L
@@ -78,43 +81,60 @@ class BridgeVpnService : VpnService() {
             ACTION_CONNECT -> startTunnel(intent.getStringExtra(EXTRA_URI).orEmpty())
             ACTION_DISCONNECT -> stopTunnel()
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun startTunnel(uri: String) {
         if (uri.isBlank()) {
+            BridgeVpnState.connected = false
             BridgeVpnState.message = "No server selected"
             return
         }
+
         stopTunnel(false)
         initializeCore()
         val core = controller
         if (core == null) {
             BridgeVpnState.connected = false
             BridgeVpnState.message = "VPN core is not available"
-            stopForeground(STOP_FOREGROUND_REMOVE)
             return
         }
+
         try {
-            startForeground(NOTIFICATION_ID, notification("Bridge is connecting"))
+            startBridgeForeground("Bridge is connecting")
+
+            // Build the Xray profile before creating the system VPN. This makes malformed
+            // subscription entries fail cleanly instead of leaving Android in VPN mode.
             val config = XrayConfigBuilder.build(uri)
+            BridgeVpnState.message = "Starting Xray..."
+
             vpnInterface = Builder()
                 .setSession("Bridge VPN")
                 .setMtu(1500)
-                .addAddress("10.7.0.2", 32)
+                .addAddress("10.0.0.2", 30)
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
                 .apply {
+                    // Xray runs inside this application's UID. Excluding Bridge itself
+                    // prevents its outbound sockets from being routed back into the TUN.
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                         addDisallowedApplication(packageName)
                     }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) setMetered(false)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        setMetered(false)
+                    }
                 }
                 .establish()
-            val pfd = vpnInterface ?: throw IllegalStateException("Android did not create the VPN interface")
+
+            val pfd = vpnInterface
+                ?: throw IllegalStateException("Android refused to create the VPN interface")
+
             core.startLoop(config, pfd.fd)
-            if (!core.isRunning) throw IllegalStateException("Xray core did not start")
+            if (!core.isRunning) {
+                throw IllegalStateException("Xray core did not enter running state")
+            }
+
             BridgeVpnState.connected = true
             BridgeVpnState.message = "Connected"
             updateNotification("Bridge connected")
@@ -153,16 +173,37 @@ class BridgeVpnService : VpnService() {
 
     override fun onBind(intent: Intent?): IBinder? = super.onBind(intent)
 
+    private fun startBridgeForeground(text: String) {
+        val notification = notification(text)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
     private fun createChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Bridge VPN", NotificationManager.IMPORTANCE_LOW))
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    CHANNEL_ID,
+                    "Bridge VPN",
+                    NotificationManager.IMPORTANCE_LOW
+                )
+            )
         }
     }
 
     private fun notification(text: String): Notification {
         val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
@@ -175,6 +216,7 @@ class BridgeVpnService : VpnService() {
     }
 
     private fun updateNotification(text: String) {
-        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(text))
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, notification(text))
     }
 }
