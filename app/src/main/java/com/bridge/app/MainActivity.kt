@@ -122,7 +122,7 @@ fun BridgeApp(onConnect: (String) -> Unit, onDisconnect: () -> Unit) {
                         onMenu = { menuOpen = !menuOpen },
                         onToggle = {
                             if (connected) onDisconnect()
-                            else servers.getOrNull(selected)?.let(onConnect) ?: run { tab = 1; message = "Select a server first." }
+                            else servers.getOrNull(selected)?.let { onConnect(it.uri) } ?: run { tab = 1; message = "Select a server first." }
                         },
                         onServers = { tab = 1; menuOpen = false },
                         onSettings = { tab = 2; menuOpen = false }
