@@ -9,7 +9,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout Bridge
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
@@ -19,10 +19,32 @@ jobs:
           java-version: '17'
           cache: gradle
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - name: Set up Go 1.26
+        uses: actions/setup-go@v6
         with:
-          gradle-version: '8.9'
+          go-version: '1.26.x'
+          cache: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools and NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools" "ndk;29.0.14206865"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+
+      - name: Build AndroidLibXrayLite AAR
+        run: |
+          git clone --depth 1 https://github.com/2dust/AndroidLibXrayLite.git /tmp/AndroidLibXrayLite
+          cd /tmp/AndroidLibXrayLite
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          gomobile init
+          go mod tidy
+          gomobile bind -v -androidapi 24 -trimpath -ldflags='-s -w -buildid= -checklinkname=0' ./
+          mkdir -p "$GITHUB_WORKSPACE/app/libs"
+          cp -v libv2ray.aar "$GITHUB_WORKSPACE/app/libs/libv2ray.aar"
 
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon
