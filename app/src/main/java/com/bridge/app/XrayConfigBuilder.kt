@@ -19,9 +19,14 @@ object XrayConfigBuilder {
         val config = JSONObject()
         config.put("log", JSONObject().put("loglevel", "warning"))
         config.put("inbounds", JSONArray().put(JSONObject()
+            .put("tag", "tun")
             .put("port", 0)
             .put("protocol", "tun")
-            .put("settings", JSONObject().put("name", "bridge0").put("mtu", 1500))))
+            .put("settings", JSONObject().put("name", "bridge0").put("MTU", 1500))
+            .put("sniffing", JSONObject()
+                .put("enabled", true)
+                .put("routeOnly", false)
+                .put("destOverride", JSONArray().put("http").put("tls").put("quic"))))
         config.put("outbounds", JSONArray()
             .put(outbound.put("tag", "proxy"))
             .put(JSONObject().put("tag", "direct").put("protocol", "freedom"))
@@ -30,7 +35,7 @@ object XrayConfigBuilder {
             .put("domainStrategy", "IPIfNonMatch")
             .put("rules", JSONArray().put(JSONObject()
                 .put("type", "field")
-                .put("inboundTag", JSONArray().put("bridge0"))
+                .put("inboundTag", JSONArray().put("tun"))
                 .put("outboundTag", "proxy"))))
         return config.toString()
     }
@@ -77,6 +82,8 @@ object XrayConfigBuilder {
         src.optString("tls").takeIf { it.isNotBlank() }?.let { q["security"] = if (it == "tls") "tls" else it }
         src.optString("sni").takeIf { it.isNotBlank() }?.let { q["sni"] = it }
         src.optString("fp").takeIf { it.isNotBlank() }?.let { q["fp"] = it }
+        src.optString("mode").takeIf { it.isNotBlank() }?.let { q["mode"] = it }
+        src.optString("extra").takeIf { it.isNotBlank() }?.let { q["extra"] = it }
         out.put("streamSettings", streamSettings(q))
         return out
     }
@@ -115,6 +122,17 @@ object XrayConfigBuilder {
             "ws" -> s.put("wsSettings", JSONObject().put("path", decode(path)).apply { host?.let { put("headers", JSONObject().put("Host", it)) } })
             "grpc" -> s.put("grpcSettings", JSONObject().put("serviceName", decode(q["serviceName"] ?: path.trim('/'))))
             "http", "h2" -> s.put("httpSettings", JSONObject().put("path", decode(path)).apply { host?.let { put("host", JSONArray().put(it)) } })
+            "httpupgrade" -> s.put("httpupgradeSettings", JSONObject().put("path", decode(path)).apply { host?.let { put("host", it) } })
+            "xhttp" -> {
+                val xhttp = JSONObject()
+                    .put("path", decode(path))
+                    .put("host", host ?: "")
+                    .put("mode", q["mode"] ?: "auto")
+                q["extra"]?.takeIf { it.isNotBlank() }?.let { raw ->
+                    try { xhttp.put("extra", JSONObject(decode(raw))) } catch (_: Exception) { }
+                }
+                s.put("xhttpSettings", xhttp)
+            }
             "tcp" -> if (!host.isNullOrBlank()) s.put("tcpSettings", JSONObject().put("header", JSONObject().put("type", "http").put("request", JSONObject().put("headers", JSONObject().put("Host", JSONArray().put(host))).put("path", JSONArray().put(path)))))
         }
         when (security.lowercase()) {
