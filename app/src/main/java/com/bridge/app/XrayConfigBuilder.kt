@@ -17,11 +17,15 @@ object XrayConfigBuilder {
             else -> throw IllegalArgumentException("Unsupported profile")
         }
 
+        // Xray TUN inbound. Keep the Android-established VPN interface as the data path.
+        // The TUN settings use Xray's current lowercase JSON field names.
         val tun = JSONObject()
             .put("tag", "tun")
             .put("port", 0)
             .put("protocol", "tun")
-            .put("settings", JSONObject().put("name", "bridge0").put("MTU", 1500))
+            .put("settings", JSONObject()
+                .put("name", "bridge0")
+                .put("mtu", 1500))
             .put("sniffing", JSONObject()
                 .put("enabled", true)
                 .put("routeOnly", false)
