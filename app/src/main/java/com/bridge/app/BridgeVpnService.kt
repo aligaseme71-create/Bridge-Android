@@ -27,7 +27,8 @@ class BridgeVpnService : VpnService() {
         const val EXTRA_URI = "uri"
         private const val CHANNEL_ID = "bridge_vpn"
         private const val NOTIFICATION_ID = 1001
-        private const val CONNECT_CHECK_TIMEOUT_MS = 15000L
+        private const val CONNECT_TIMEOUT_MS = 15000L
+        private const val TEST_URL = "https://www.gstatic.com/generate_204"
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -35,14 +36,17 @@ class BridgeVpnService : VpnService() {
     private var coreInitialized = false
     private var stopping = false
     private val handler = Handler(Looper.getMainLooper())
-    private val worker = Executors.newSingleThreadExecutor()
+    private val worker = Executors.newCachedThreadPool()
 
     private val callback = object : CoreCallbackHandler {
         override fun startup(): Long {
-            // The Xray core has successfully started. The service will also run a
-            // real outbound check before presenting the final green state.
-            BridgeVpnState.message = "Xray started"
-            handler.post { updateNotification("Bridge is checking connection") }
+            // startLoop() is long-running. The callback is the reliable point at
+            // which Xray has actually started; do not wait for startLoop() to return.
+            if (!stopping) {
+                BridgeVpnState.connected = true
+                BridgeVpnState.message = "Connected"
+                handler.post { updateNotification("Bridge connected") }
+            }
             return 0L
         }
 
@@ -105,11 +109,24 @@ class BridgeVpnService : VpnService() {
         try {
             stopping = false
             BridgeVpnState.connected = false
-            BridgeVpnState.message = "Preparing VPN..."
-            startBridgeForeground("Bridge is connecting")
+            BridgeVpnState.message = "Testing server..."
+            startBridgeForeground("Bridge is testing server")
 
             val config = XrayConfigBuilder.build(uri)
-            BridgeVpnState.message = "Starting Xray..."
+
+            // Validate the selected node before creating the Android VPN tunnel.
+            // measureOutboundDelay is the same real Xray outbound test used by the
+            // server list, so a dead/invalid node fails before Android shows a VPN
+            // connected state.
+            val delayMs = try {
+                Libv2ray.measureOutboundDelay(config, TEST_URL)
+            } catch (e: Exception) {
+                throw IllegalStateException("Server test failed: ${e.message ?: e.javaClass.simpleName}")
+            }
+            if (delayMs < 0L) throw IllegalStateException("Selected server is unreachable")
+            if (stopping) return
+
+            BridgeVpnState.message = "Starting VPN • ${delayMs} ms"
 
             vpnInterface = Builder()
                 .setSession("Bridge VPN")
@@ -126,30 +143,13 @@ class BridgeVpnService : VpnService() {
 
             val pfd = vpnInterface ?: throw IllegalStateException("Android refused to create the VPN interface")
 
-            // Keep the ParcelFileDescriptor alive for the complete lifetime of the
-            // core. Android's VPN interface alone is not proof that the proxy works.
             worker.execute {
                 try {
                     core.startLoop(config, pfd.fd)
-                    if (!core.isRunning) {
-                        throw IllegalStateException("Xray core did not remain running")
+                    Log.i("BridgeVPN", "Xray startLoop returned")
+                    if (!stopping) {
+                        handler.post { fail("Xray core stopped") }
                     }
-
-                    handler.post { updateNotification("Bridge is checking server") }
-
-                    // Validate the selected proxy through the running core. This is
-                    // separate from the Android VPN permission/interface check and
-                    // prevents a false green CONNECT state when the node is dead or
-                    // its configuration is invalid.
-                    val delayMs = core.measureDelay("https://www.gstatic.com/generate_204")
-                    if (stopping) return@execute
-                    if (delayMs < 0L) {
-                        throw IllegalStateException("Selected server is unreachable")
-                    }
-
-                    BridgeVpnState.connected = true
-                    BridgeVpnState.message = "Connected • ${delayMs} ms"
-                    handler.post { updateNotification("Bridge connected • ${delayMs} ms") }
                 } catch (e: Exception) {
                     Log.e("BridgeVPN", "Xray connection failed", e)
                     handler.post {
@@ -158,17 +158,13 @@ class BridgeVpnService : VpnService() {
                 }
             }
 
-            // If startup gets stuck before the core can prove connectivity, fail
-            // cleanly instead of leaving the Android VPN icon active indefinitely.
+            // Xray startup is signaled by callback.startup(). Do not wait for
+            // startLoop() to return because that method normally blocks until stop.
             handler.postDelayed({
                 if (!stopping && !BridgeVpnState.connected) {
-                    try {
-                        if (!core.isRunning) fail("Xray core stopped during startup")
-                    } catch (_: Exception) {
-                        fail("VPN startup timed out")
-                    }
+                    fail("VPN startup timed out")
                 }
-            }, CONNECT_CHECK_TIMEOUT_MS)
+            }, CONNECT_TIMEOUT_MS)
         } catch (e: Exception) {
             Log.e("BridgeVPN", "Start failed", e)
             try { core.stopLoop() } catch (_: Exception) { }
