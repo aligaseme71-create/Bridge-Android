@@ -8,7 +8,9 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import go.Seq
@@ -34,6 +36,7 @@ class BridgeVpnService : VpnService() {
     private var vpnInterface: android.os.ParcelFileDescriptor? = null
     private var controller: CoreController? = null
     private var coreInitialized = false
+    private val handler = Handler(Looper.getMainLooper())
 
     private val callback = object : CoreCallbackHandler {
         override fun startup(): Long {
@@ -86,8 +89,7 @@ class BridgeVpnService : VpnService() {
 
     private fun startTunnel(uri: String) {
         if (uri.isBlank()) {
-            BridgeVpnState.connected = false
-            BridgeVpnState.message = "No server selected"
+            fail("No server selected")
             return
         }
 
@@ -95,16 +97,19 @@ class BridgeVpnService : VpnService() {
         initializeCore()
         val core = controller
         if (core == null) {
-            BridgeVpnState.connected = false
-            BridgeVpnState.message = "VPN core is not available"
+            fail("VPN core is not available")
             return
         }
 
         try {
+            // The Android VPN documentation expects the VPN service to be started first,
+            // then promoted to foreground. Keep this notification alive throughout startup
+            // so failures are visible instead of looking like a dead CONNECT button.
             startBridgeForeground("Bridge is connecting")
+            BridgeVpnState.connected = false
+            BridgeVpnState.message = "Preparing VPN..."
 
-            // Build the Xray profile before creating the system VPN. This makes malformed
-            // subscription entries fail cleanly instead of leaving Android in VPN mode.
+            // Build Xray profile before establishing the system VPN.
             val config = XrayConfigBuilder.build(uri)
             BridgeVpnState.message = "Starting Xray..."
 
@@ -116,8 +121,6 @@ class BridgeVpnService : VpnService() {
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
                 .apply {
-                    // Xray runs inside this application's UID. Excluding Bridge itself
-                    // prevents its outbound sockets from being routed back into the TUN.
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                         addDisallowedApplication(packageName)
                     }
@@ -140,16 +143,28 @@ class BridgeVpnService : VpnService() {
             updateNotification("Bridge connected")
         } catch (e: Exception) {
             Log.e("BridgeVPN", "Start failed", e)
-            BridgeVpnState.connected = false
-            BridgeVpnState.message = "Connection failed: ${e.message ?: e.javaClass.simpleName}"
             try { core.stopLoop() } catch (_: Exception) { }
             try { vpnInterface?.close() } catch (_: Exception) { }
             vpnInterface = null
-            stopForeground(STOP_FOREGROUND_REMOVE)
+            fail("Connection failed: ${e.message ?: e.javaClass.simpleName}")
         }
     }
 
+    private fun fail(text: String) {
+        BridgeVpnState.connected = false
+        BridgeVpnState.message = text
+        Log.e("BridgeVPN", text)
+        try {
+            updateNotification(text)
+        } catch (_: Exception) { }
+        // Leave the error notification visible briefly so the user can see why CONNECT failed.
+        handler.postDelayed({
+            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) { }
+        }, 5000L)
+    }
+
     private fun stopTunnel(stopService: Boolean = true) {
+        handler.removeCallbacksAndMessages(null)
         try { controller?.stopLoop() } catch (_: Exception) { }
         try { vpnInterface?.close() } catch (_: Exception) { }
         vpnInterface = null
