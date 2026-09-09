@@ -35,6 +35,10 @@ jobs:
             "https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.7.19/libv2ray.aar"
           ls -lh "$GITHUB_WORKSPACE/app/libs/libv2ray.aar"
 
+      - name: Restore known-good MainActivity baseline
+        run: |
+          git show 135387de893ec0403991da76c23e65c03695f410:app/src/main/java/com/bridge/app/MainActivity.kt > app/src/main/java/com/bridge/app/MainActivity.kt
+
       - name: Apply Bridge source enhancements
         run: python3 tools/patch_main_activity.py
 
