@@ -20,12 +20,6 @@ import libv2ray.CoreController
 import libv2ray.Libv2ray
 import java.util.concurrent.Executors
 
-object BridgeVpnState {
-    @Volatile var connected: Boolean = false
-    @Volatile var message: String = ""
-    @Volatile var latency: Long = -1L
-}
-
 class BridgeVpnService : VpnService() {
     companion object {
         const val ACTION_CONNECT = "com.bridge.app.CONNECT"
@@ -123,20 +117,13 @@ class BridgeVpnService : VpnService() {
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
                 .apply {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                        addDisallowedApplication(packageName)
-                    }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        setMetered(false)
-                    }
+                    addDisallowedApplication(packageName)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) setMetered(false)
                 }
                 .establish()
 
-            val pfd = vpnInterface
-                ?: throw IllegalStateException("Android refused to create the VPN interface")
+            val pfd = vpnInterface ?: throw IllegalStateException("Android refused to create the VPN interface")
 
-            // startLoop may perform native startup work. Do it off the main thread while
-            // retaining the ParcelFileDescriptor as a service field for the whole session.
             worker.execute {
                 try {
                     core.startLoop(config, pfd.fd)
@@ -147,14 +134,9 @@ class BridgeVpnService : VpnService() {
                     }
                 } catch (e: Exception) {
                     Log.e("BridgeVPN", "Xray startLoop failed", e)
-                    handler.post {
-                        if (!stopping) fail("Connection failed: ${e.message ?: e.javaClass.simpleName}")
-                    }
+                    handler.post { if (!stopping) fail("Connection failed: ${e.message ?: e.javaClass.simpleName}") }
                 }
             }
-
-            // The native callback is authoritative for the connected state.
-            BridgeVpnState.message = "Connecting..."
         } catch (e: Exception) {
             Log.e("BridgeVPN", "Start failed", e)
             try { core.stopLoop() } catch (_: Exception) { }
@@ -169,14 +151,11 @@ class BridgeVpnService : VpnService() {
         BridgeVpnState.message = text
         Log.e("BridgeVPN", text)
         try { updateNotification(text) } catch (_: Exception) { }
-        handler.postDelayed({
-            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) { }
-        }, 5000L)
+        handler.postDelayed({ try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) { } }, 5000L)
     }
 
     private fun stopTunnel(stopService: Boolean = true) {
         stopping = true
-        handler.removeCallbacksAndMessages(null)
         try { controller?.stopLoop() } catch (_: Exception) { }
         try { vpnInterface?.close() } catch (_: Exception) { }
         vpnInterface = null
@@ -204,11 +183,7 @@ class BridgeVpnService : VpnService() {
     private fun startBridgeForeground(text: String) {
         val notification = notification(text)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
@@ -216,22 +191,15 @@ class BridgeVpnService : VpnService() {
 
     private fun createChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(
-                NotificationChannel(
-                    CHANNEL_ID,
-                    "Bridge VPN",
-                    NotificationManager.IMPORTANCE_LOW
-                )
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(CHANNEL_ID, "Bridge VPN", NotificationManager.IMPORTANCE_LOW)
             )
         }
     }
 
     private fun notification(text: String): Notification {
         val open = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java),
+            this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
@@ -244,7 +212,6 @@ class BridgeVpnService : VpnService() {
     }
 
     private fun updateNotification(text: String) {
-        getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_ID, notification(text))
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(text))
     }
 }
