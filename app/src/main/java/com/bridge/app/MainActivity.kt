@@ -36,8 +36,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -50,11 +51,16 @@ import java.util.Base64
 
 data class ServerProfile(val name: String, val uri: String, val protocol: String, val latency: Long = -1)
 
+action object BridgeVpnState {
+    @Volatile var connected: Boolean = false
+    @Volatile var message: String = ""
+}
+
 class MainActivity : ComponentActivity() {
     private var pendingUri: String? = null
 
     private val vpnPermission = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-        if (it.resultCode == RESULT_OK) pendingUri?.let { uri -> startVpn(uri) }
+        if (it.resultCode == RESULT_OK) pendingUri?.let(::startVpn)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -73,7 +79,7 @@ class MainActivity : ComponentActivity() {
             action = BridgeVpnService.ACTION_CONNECT
             putExtra(BridgeVpnService.EXTRA_URI, uri)
         }
-        ContextCompat.startForegroundService(this, intent)
+        startService(intent)
     }
 
     private fun stopVpn() {
@@ -85,7 +91,7 @@ private val Navy = Color(0xFF03111F)
 private val DeepNavy = Color(0xFF010811)
 private val Panel = Color(0xCC0A1C2D)
 private val LightBg = Color(0xFFF5F8FC)
-private val LightPanel = Color(0xFFFFFFFF)
+private val LightPanel = Color.White
 private val Blue = Color(0xFF159BFF)
 private val Cyan = Color(0xFF00D9FF)
 private val Green = Color(0xFF22D66B)
@@ -94,12 +100,14 @@ private val Muted = Color(0xFFAABBCD)
 private val LightText = Color(0xFF102033)
 private val LightMuted = Color(0xFF60758A)
 
+private enum class Tab { HOME, SERVERS, SUBSCRIPTION }
+
 @Composable
 fun BridgeApp(onConnect: (String) -> Unit, onDisconnect: () -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val prefs = remember { context.getSharedPreferences("bridge", 0) }
     var connected by remember { mutableStateOf(BridgeVpnState.connected) }
-    var tab by remember { mutableStateOf(0) }
+    var tab by remember { mutableStateOf(Tab.HOME) }
     var menuOpen by remember { mutableStateOf(false) }
     var subUrl by remember { mutableStateOf(prefs.getString("subscription_url", "").orEmpty()) }
     var servers by remember { mutableStateOf(loadSavedServers(prefs)) }
@@ -113,25 +121,42 @@ fun BridgeApp(onConnect: (String) -> Unit, onDisconnect: () -> Unit) {
     LaunchedEffect(Unit) {
         while (true) {
             connected = BridgeVpnState.connected
-            delay(250)
+            delay(200)
         }
     }
 
-    fun testServer(index: Int) {
-        if (index !in servers.indices || testing) return
+    fun updateLatencies(autoConnect: Boolean = false) {
+        if (servers.isEmpty() || testing) return
         testing = true
-        val profile = servers[index]
+        message = "Testing all servers..."
+        val snapshot = servers
         scope.launch(Dispatchers.IO) {
-            val delayMs = try {
-                val config = XrayConfigBuilder.build(profile.uri)
-                libv2ray.Libv2ray.measureOutboundDelay(config, "https://www.gstatic.com/generate_204")
-            } catch (_: Exception) { -1L }
-            withContext(Dispatchers.Main) {
-                servers = servers.toMutableList().also {
-                    if (index in it.indices) it[index] = profile.copy(latency = delayMs)
+            val results = snapshot.map { profile ->
+                async {
+                    try {
+                        val config = XrayConfigBuilder.build(profile.uri)
+                        libv2ray.Libv2ray.measureOutboundDelay(config, "https://www.gstatic.com/generate_204")
+                    } catch (_: Exception) { -1L }
                 }
+            }.awaitAll()
+            val refreshed = snapshot.mapIndexed { index, profile ->
+                profile.copy(latency = results.getOrElse(index) { -1L })
+            }
+            val bestIndex = refreshed.indices
+                .filter { refreshed[it].latency >= 0 }
+                .minByOrNull { refreshed[it].latency }
+            withContext(Dispatchers.Main) {
+                servers = refreshed
+                saveServers(prefs, refreshed)
                 testing = false
-                saveServers(prefs, servers)
+                if (bestIndex != null) {
+                    selected = bestIndex
+                    prefs.edit().putInt("selected_server", bestIndex).apply()
+                    message = "Fastest: ${refreshed[bestIndex].name} • ${refreshed[bestIndex].latency} ms"
+                    if (autoConnect) onConnect(refreshed[bestIndex].uri)
+                } else {
+                    message = "No reachable server was found."
+                }
             }
         }
     }
@@ -140,7 +165,23 @@ fun BridgeApp(onConnect: (String) -> Unit, onDisconnect: () -> Unit) {
         if (index !in servers.indices) return
         selected = index
         prefs.edit().putInt("selected_server", index).apply()
-        testServer(index)
+    }
+
+    fun testOne(index: Int) {
+        if (index !in servers.indices || testing) return
+        testing = true
+        val profile = servers[index]
+        scope.launch(Dispatchers.IO) {
+            val result = try {
+                val config = XrayConfigBuilder.build(profile.uri)
+                libv2ray.Libv2ray.measureOutboundDelay(config, "https://www.gstatic.com/generate_204")
+            } catch (_: Exception) { -1L }
+            withContext(Dispatchers.Main) {
+                servers = servers.toMutableList().also { it[index] = profile.copy(latency = result) }
+                saveServers(prefs, servers)
+                testing = false
+            }
+        }
     }
 
     fun importSubscription() {
@@ -158,13 +199,17 @@ fun BridgeApp(onConnect: (String) -> Unit, onDisconnect: () -> Unit) {
                 prefs.edit().putString("subscription_url", subUrl).putInt("selected_server", 0).apply()
                 saveServers(prefs, result)
                 message = "${result.size} servers imported successfully."
-                tab = 1
-                testServer(0)
+                tab = Tab.SERVERS
             } else {
                 message = "No supported profiles found."
             }
             updating = false
         }
+    }
+
+    fun toggleTheme() {
+        darkMode = !darkMode
+        prefs.edit().putBoolean("dark_mode", darkMode).apply()
     }
 
     val colors = if (darkMode) {
@@ -174,32 +219,46 @@ fun BridgeApp(onConnect: (String) -> Unit, onDisconnect: () -> Unit) {
     }
 
     MaterialTheme(colorScheme = colors) {
-        Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            Box(modifier = Modifier.fillMaxSize()) {
+        Scaffold(
+            containerColor = MaterialTheme.colorScheme.background,
+            bottomBar = {
+                BridgeBottomBar(tab, darkMode) { tab = it; menuOpen = false }
+            }
+        ) { padding ->
+            Box(modifier = Modifier.fillMaxSize().padding(padding)) {
                 when (tab) {
-                    0 -> HomeScreen(
+                    Tab.HOME -> HomeScreen(
                         darkMode = darkMode,
                         connected = connected,
                         server = servers.getOrNull(selected),
+                        testing = testing,
                         menuOpen = menuOpen,
                         onMenu = { menuOpen = !menuOpen },
                         onToggle = {
                             if (connected) onDisconnect()
                             else servers.getOrNull(selected)?.let { onConnect(it.uri) } ?: run {
-                                tab = 2
+                                tab = Tab.SUBSCRIPTION
                                 message = "Add a subscription first."
                             }
                         },
-                        onServers = { tab = 1; menuOpen = false },
-                        onSubscription = { tab = 2; menuOpen = false },
-                        onTheme = {
-                            darkMode = !darkMode
-                            prefs.edit().putBoolean("dark_mode", darkMode).apply()
-                            menuOpen = false
-                        }
+                        onServers = { tab = Tab.SERVERS; menuOpen = false },
+                        onSubscription = { tab = Tab.SUBSCRIPTION; menuOpen = false },
+                        onTheme = { toggleTheme() },
+                        onFastest = { updateLatencies(autoConnect = true) },
+                        fastestEnabled = servers.isNotEmpty() && !testing
                     )
-                    1 -> ServersScreen(darkMode, servers, selected, testing, ::selectServer) { tab = 0 }
-                    else -> SubscriptionScreen(
+                    Tab.SERVERS -> ServersScreen(
+                        darkMode = darkMode,
+                        servers = servers,
+                        selected = selected,
+                        testing = testing,
+                        onSelect = ::selectServer,
+                        onTestOne = ::testOne,
+                        onPingAll = { updateLatencies(false) },
+                        onFastest = { updateLatencies(true) },
+                        onBack = { tab = Tab.HOME }
+                    )
+                    Tab.SUBSCRIPTION -> SubscriptionScreen(
                         darkMode = darkMode,
                         url = subUrl,
                         onUrl = {
@@ -210,14 +269,10 @@ fun BridgeApp(onConnect: (String) -> Unit, onDisconnect: () -> Unit) {
                         message = message,
                         serverCount = servers.size,
                         onImport = ::importSubscription,
-                        onTheme = {
-                            darkMode = !darkMode
-                            prefs.edit().putBoolean("dark_mode", darkMode).apply()
-                        },
-                        onBack = { tab = 0 }
+                        onTheme = { toggleTheme() },
+                        onBack = { tab = Tab.HOME }
                     )
                 }
-                BottomNav(tab, darkMode) { tab = it; menuOpen = false }
             }
         }
     }
@@ -228,12 +283,15 @@ private fun HomeScreen(
     darkMode: Boolean,
     connected: Boolean,
     server: ServerProfile?,
+    testing: Boolean,
     menuOpen: Boolean,
     onMenu: () -> Unit,
     onToggle: () -> Unit,
     onServers: () -> Unit,
     onSubscription: () -> Unit,
-    onTheme: () -> Unit
+    onTheme: () -> Unit,
+    onFastest: () -> Unit,
+    fastestEnabled: Boolean
 ) {
     val bg = if (darkMode) Navy else LightBg
     val text = if (darkMode) Color.White else LightText
@@ -242,72 +300,125 @@ private fun HomeScreen(
 
     Box(modifier = Modifier.fillMaxSize().background(bg)) {
         if (darkMode) BridgeBackdrop() else LightBridgeBackdrop()
-        Column(modifier = Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 12.dp)) {
+        Column(modifier = Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 10.dp)) {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text("☰", color = text, fontSize = 30.sp, modifier = Modifier.clickable { onMenu() })
+                Text("☰", color = text, fontSize = 30.sp, modifier = Modifier.clickable(onClick = onMenu))
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text("Bridge", color = text, fontSize = 34.sp, fontWeight = FontWeight.Bold)
-                    Text("SECURE  •  PRIVATE  •  GLOBAL", color = muted, fontSize = 9.sp, letterSpacing = 1.6.sp)
+                    Text("SECURE • PRIVATE • GLOBAL", color = muted, fontSize = 9.sp, letterSpacing = 1.6.sp)
                 }
-                Text("⚙", color = text, fontSize = 27.sp, modifier = Modifier.clickable { onSubscription() })
+                Text("⚙", color = text, fontSize = 27.sp, modifier = Modifier.clickable(onClick = onSubscription))
             }
+
             if (menuOpen) {
-                Card(modifier = Modifier.padding(top = 5.dp).width(205.dp), colors = CardDefaults.cardColors(if (darkMode) Color(0xF20B2032) else Color.White), shape = RoundedCornerShape(16.dp), elevation = CardDefaults.cardElevation(8.dp)) {
+                Card(
+                    modifier = Modifier.padding(top = 5.dp).width(215.dp),
+                    colors = CardDefaults.cardColors(if (darkMode) Color(0xF20B2032) else Color.White),
+                    shape = RoundedCornerShape(16.dp), elevation = CardDefaults.cardElevation(8.dp)
+                ) {
                     Column(modifier = Modifier.padding(8.dp)) {
-                        MenuItem("⌂  Home", text) { onMenu() }
-                        MenuItem("▤  Servers", text, onServers)
-                        MenuItem("🔗  Subscription", text, onSubscription)
-                        MenuItem(if (darkMode) "☀  Light Mode" else "☾  Dark Mode", text, onTheme)
+                        MenuItem("Home", text) { onMenu() }
+                        MenuItem("Servers", text, onServers)
+                        MenuItem("Subscription", text, onSubscription)
+                        MenuItem(if (darkMode) "Light Mode" else "Dark Mode", text, onTheme)
                     }
                 }
             }
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(if (connected) "PROTECTED\nCONNECTION\nACTIVE" else "YOUR PRIVACY\nOUR PRIORITY", color = if (connected) Green else muted, fontSize = 16.sp, fontWeight = FontWeight.Medium, lineHeight = 23.sp)
+
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                if (connected) "PROTECTED\nCONNECTION\nACTIVE" else "YOUR PRIVACY\nOUR PRIORITY",
+                color = if (connected) Green else muted,
+                fontSize = 16.sp, fontWeight = FontWeight.Medium, lineHeight = 23.sp
+            )
             Spacer(modifier = Modifier.weight(1f))
-            PowerButton(connected, onToggle)
-            Spacer(modifier = Modifier.height(12.dp))
-            Text(if (connected) "Connected" else "Disconnected", color = if (connected) Green else Red, fontSize = 18.sp, fontWeight = FontWeight.Bold, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
-            Text(if (connected) "Secure tunnel is active" else "Tap the power button to connect", color = muted, fontSize = 12.sp, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
-            Spacer(modifier = Modifier.height(12.dp))
-            Card(modifier = Modifier.fillMaxWidth().clickable { onServers() }, colors = CardDefaults.cardColors(panel), shape = RoundedCornerShape(19.dp), elevation = CardDefaults.cardElevation(if (darkMode) 0.dp else 3.dp)) {
+
+            ConnectPowerButton(connected, testing, onToggle)
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                if (testing) "Finding fastest server..."
+                else if (connected) "Connected"
+                else "Disconnected",
+                color = if (connected) Green else if (testing) Blue else Red,
+                fontSize = 19.sp, fontWeight = FontWeight.Bold,
+                modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center
+            )
+            Text(
+                if (connected) "Secure tunnel is active" else "Tap the power button to connect",
+                color = muted, fontSize = 12.sp,
+                modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center
+            )
+
+            Spacer(modifier = Modifier.height(10.dp))
+            Button(
+                onClick = onFastest,
+                enabled = fastestEnabled,
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Text(if (testing) "TESTING SERVERS..." else "FASTEST SERVER • CONNECT", fontWeight = FontWeight.Bold)
+            }
+
+            Spacer(modifier = Modifier.height(9.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth().clickable(onClick = onServers),
+                colors = CardDefaults.cardColors(panel),
+                shape = RoundedCornerShape(19.dp),
+                elevation = CardDefaults.cardElevation(if (darkMode) 0.dp else 3.dp)
+            ) {
                 Row(modifier = Modifier.padding(15.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("⚡", color = Blue, fontSize = 25.sp)
+                    Text("FAST", color = Cyan, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.background(Blue.copy(alpha = .16f), RoundedCornerShape(8.dp)).padding(horizontal = 8.dp, vertical = 5.dp))
                     Spacer(modifier = Modifier.width(11.dp))
                     Column(modifier = Modifier.weight(1f)) {
-                        Text(server?.name ?: "Auto Select", color = text, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
-                        Text(server?.let { if (it.latency >= 0) "${it.protocol} • ${it.latency} ms" else it.protocol } ?: "Fastest available server", color = muted, fontSize = 12.sp)
+                        Text(server?.name ?: "Auto Select", color = text, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                        Text(
+                            server?.let { if (it.latency >= 0) "${it.protocol} • ${it.latency} ms" else it.protocol }
+                                ?: "Fastest available server",
+                            color = muted, fontSize = 12.sp
+                        )
                     }
                     Text("›", color = muted, fontSize = 31.sp)
                 }
             }
+
             Spacer(modifier = Modifier.height(8.dp))
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                StatCard("⚡", "Ping", if (server?.latency ?: -1 >= 0) "${server!!.latency} ms" else "-- ms", darkMode, Modifier.weight(1f))
-                StatCard("↓", "Download", "-- Mbps", darkMode, Modifier.weight(1f))
-                StatCard("↑", "Upload", "-- Mbps", darkMode, Modifier.weight(1f))
+                StatCard("PING", if (server?.latency ?: -1 >= 0) "${server!!.latency} ms" else "--", darkMode, Modifier.weight(1f))
+                StatCard("DOWNLOAD", "--", darkMode, Modifier.weight(1f))
+                StatCard("UPLOAD", "--", darkMode, Modifier.weight(1f))
             }
-            Spacer(modifier = Modifier.height(76.dp))
+            Spacer(modifier = Modifier.height(2.dp))
         }
     }
 }
 
 @Composable
-private fun PowerButton(connected: Boolean, onClick: () -> Unit) {
+private fun ConnectPowerButton(connected: Boolean, testing: Boolean, onClick: () -> Unit) {
     val transition = rememberInfiniteTransition(label = "powerPulse")
-    val pulse by transition.animateFloat(0.55f, 1f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "pulse")
-    val active = if (connected) Green else Red
+    val pulse by transition.animateFloat(0.52f, 1f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "pulse")
+    val accent = if (connected) Green else if (testing) Blue else Red
     Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-        Canvas(modifier = Modifier.size(215.dp).clickable { onClick() }) {
-            val c = Offset(size.width / 2f, size.height / 2f)
-            val radius = size.minDimension * .40f
-            drawCircle(active.copy(alpha = .10f * pulse), radius * 1.25f)
-            drawCircle(active.copy(alpha = .18f * pulse), radius * 1.08f)
-            drawCircle(Color(0xFF071726), radius * .96f)
-            drawCircle(active.copy(alpha = pulse), radius, style = Stroke(width = 7.dp.toPx()))
-            drawCircle(active.copy(alpha = .22f), radius * .88f, style = Stroke(width = 2.dp.toPx()))
-            val p = radius * .36f
-            drawArc(active, -50f, 280f, false, topLeft = Offset(c.x - p, c.y - p), size = androidx.compose.ui.geometry.Size(p * 2f, p * 2f), style = Stroke(width = 7.dp.toPx(), cap = StrokeCap.Round))
-            drawLine(active, Offset(c.x, c.y - p * 1.12f), Offset(c.x, c.y + p * .20f), strokeWidth = 7.dp.toPx(), cap = StrokeCap.Round)
+        Box(
+            modifier = Modifier.size(220.dp).clip(CircleShape).clickable(enabled = !testing, onClick = onClick),
+            contentAlignment = Alignment.Center
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val c = Offset(size.width / 2f, size.height / 2f)
+                val r = size.minDimension * .38f
+                drawCircle(accent.copy(alpha = .10f * pulse), r * 1.32f)
+                drawCircle(accent.copy(alpha = .16f * pulse), r * 1.08f)
+                drawCircle(Color(0xFF071726), r * .98f)
+                drawCircle(accent.copy(alpha = pulse), r, style = Stroke(width = 7.dp.toPx()))
+                drawCircle(accent.copy(alpha = .25f), r * .88f, style = Stroke(width = 2.dp.toPx()))
+                val p = r * .34f
+                drawArc(accent, -50f, 280f, false,
+                    topLeft = Offset(c.x - p, c.y - p),
+                    size = androidx.compose.ui.geometry.Size(p * 2f, p * 2f),
+                    style = Stroke(width = 8.dp.toPx(), cap = StrokeCap.Round))
+                drawLine(accent, Offset(c.x, c.y - p * 1.12f), Offset(c.x, c.y + p * .20f), 8.dp.toPx(), cap = StrokeCap.Round)
+            }
+            Text(if (connected) "DISCONNECT" else "CONNECT", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -316,7 +427,7 @@ private fun PowerButton(connected: Boolean, onClick: () -> Unit) {
 private fun BridgeBackdrop() {
     Canvas(modifier = Modifier.fillMaxSize()) {
         drawRect(Brush.verticalGradient(listOf(Color(0xFF062849), Navy, DeepNavy)))
-        val globe = Offset(size.width * .5f, size.height * .28f)
+        val globe = Offset(size.width * .5f, size.height * .27f)
         drawCircle(Color(0x2200BFFF), size.width * .43f, globe)
         for (i in 0..24) drawCircle(Color(0x6628BFFF), 2f, Offset(size.width * i / 24f, size.height * (.15f + (i % 7) * .018f)))
         val y = size.height * .39f
@@ -344,74 +455,96 @@ private fun LightBridgeBackdrop() {
 
 @Composable
 private fun MenuItem(text: String, textColor: Color, onClick: () -> Unit) {
-    Text(text, color = textColor, fontSize = 15.sp, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable { onClick() }.padding(12.dp))
+    Text(text, color = textColor, fontSize = 15.sp,
+        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable(onClick = onClick).padding(12.dp))
 }
 
 @Composable
-private fun StatCard(icon: String, title: String, value: String, darkMode: Boolean, modifier: Modifier) {
+private fun StatCard(title: String, value: String, darkMode: Boolean, modifier: Modifier) {
     val panel = if (darkMode) Color(0xCC091B2C) else Color.White
     val text = if (darkMode) Color.White else LightText
     val muted = if (darkMode) Muted else LightMuted
     Card(modifier = modifier, colors = CardDefaults.cardColors(panel), shape = RoundedCornerShape(14.dp), elevation = CardDefaults.cardElevation(if (darkMode) 0.dp else 2.dp)) {
         Column(modifier = Modifier.padding(vertical = 8.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(icon, color = Blue, fontSize = 19.sp)
-            Text(title, color = muted, fontSize = 10.sp)
-            Text(value, color = text, fontSize = 10.sp)
+            Text(title, color = muted, fontSize = 9.sp, fontWeight = FontWeight.SemiBold)
+            Text(value, color = text, fontSize = 11.sp, fontWeight = FontWeight.Bold)
         }
     }
 }
 
 @Composable
-private fun BottomNav(tab: Int, darkMode: Boolean, onTab: (Int) -> Unit) {
-    val bg = if (darkMode) Color(0xF20A1A2A) else Color(0xF8FFFFFF)
-    val text = if (darkMode) Muted else LightMuted
-    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
-        Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 9.dp).height(68.dp).background(bg, RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)).border(1.dp, if (darkMode) Color(0x223E83B5) else Color(0x22000000), RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-            listOf("⌂" to "Home", "▤" to "Servers", "🔗" to "Subscription").forEachIndexed { i, item ->
-                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(105.dp).clickable { onTab(i) }) {
-                    Text(item.first, color = if (tab == i) Blue else text, fontSize = 23.sp)
-                    Text(item.second, color = if (tab == i) Blue else text, fontSize = 10.sp, fontWeight = if (tab == i) FontWeight.Bold else FontWeight.Normal)
-                }
-            }
-        }
+private fun BridgeBottomBar(tab: Tab, darkMode: Boolean, onTab: (Tab) -> Unit) {
+    NavigationBar(containerColor = if (darkMode) Color(0xF20A1A2A) else Color.White) {
+        NavigationBarItem(selected = tab == Tab.HOME, onClick = { onTab(Tab.HOME) }, icon = { Text("⌂", fontSize = 23.sp) }, label = { Text("Home") })
+        NavigationBarItem(selected = tab == Tab.SERVERS, onClick = { onTab(Tab.SERVERS) }, icon = { Text("≡", fontSize = 23.sp) }, label = { Text("Servers") })
+        NavigationBarItem(selected = tab == Tab.SUBSCRIPTION, onClick = { onTab(Tab.SUBSCRIPTION) }, icon = { Text("🔗", fontSize = 20.sp) }, label = { Text("Subscription") })
     }
 }
 
 @Composable
-private fun ServersScreen(darkMode: Boolean, servers: List<ServerProfile>, selected: Int, testing: Boolean, onSelect: (Int) -> Unit, onBack: () -> Unit) {
+private fun ServersScreen(
+    darkMode: Boolean,
+    servers: List<ServerProfile>,
+    selected: Int,
+    testing: Boolean,
+    onSelect: (Int) -> Unit,
+    onTestOne: (Int) -> Unit,
+    onPingAll: () -> Unit,
+    onFastest: () -> Unit,
+    onBack: () -> Unit
+) {
     val text = if (darkMode) Color.White else LightText
     val muted = if (darkMode) Muted else LightMuted
     val panel = if (darkMode) Panel else Color.White
-    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 14.dp)) {
+    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("‹", color = text, fontSize = 34.sp, modifier = Modifier.clickable { onBack() })
+            Text("‹", color = text, fontSize = 34.sp, modifier = Modifier.clickable(onClick = onBack))
             Spacer(modifier = Modifier.width(8.dp))
-            Column {
+            Column(modifier = Modifier.weight(1f)) {
                 Text("SERVERS", color = text, fontSize = 25.sp, fontWeight = FontWeight.Bold)
                 Text("${servers.size} servers loaded", color = muted, fontSize = 12.sp)
             }
         }
-        Spacer(modifier = Modifier.height(12.dp))
-        if (testing) Text("Testing selected server...", color = Blue, fontSize = 13.sp)
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = onPingAll, enabled = servers.isNotEmpty() && !testing, modifier = Modifier.weight(1f), shape = RoundedCornerShape(12.dp)) {
+                Text(if (testing) "PINGING..." else "PING ALL", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+            }
+            Button(onClick = onFastest, enabled = servers.isNotEmpty() && !testing, modifier = Modifier.weight(1f), shape = RoundedCornerShape(12.dp)) {
+                Text("FASTEST + CONNECT", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+            }
+        }
+        if (testing) {
+            Spacer(modifier = Modifier.height(7.dp))
+            Text("Testing all servers for lowest latency...", color = Blue, fontSize = 12.sp)
+        }
         Spacer(modifier = Modifier.height(8.dp))
         if (servers.isEmpty()) {
             Card(colors = CardDefaults.cardColors(panel), shape = RoundedCornerShape(18.dp)) {
                 Text("No servers yet. Open Subscription and import your link.", color = muted, modifier = Modifier.padding(18.dp))
             }
         } else {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(bottom = 90.dp)) {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(bottom = 20.dp)) {
                 itemsIndexed(servers, key = { _, s -> s.uri }) { i, s ->
-                    Card(modifier = Modifier.fillMaxWidth().clickable { onSelect(i) }, colors = CardDefaults.cardColors(if (i == selected) Color(0xCC123557) else panel), shape = RoundedCornerShape(16.dp), elevation = CardDefaults.cardElevation(if (darkMode) 0.dp else 2.dp)) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth().clickable { onSelect(i) },
+                        colors = CardDefaults.cardColors(if (i == selected) Color(0xCC123557) else panel),
+                        shape = RoundedCornerShape(16.dp),
+                        elevation = CardDefaults.cardElevation(if (darkMode) 0.dp else 2.dp)
+                    ) {
                         Row(modifier = Modifier.padding(13.dp), verticalAlignment = Alignment.CenterVertically) {
                             Box(modifier = Modifier.size(39.dp).background(if (i == selected) Blue.copy(alpha = .18f) else Blue.copy(alpha = .08f), CircleShape), contentAlignment = Alignment.Center) {
-                                Text(protocolIcon(s.protocol), color = Blue, fontSize = 18.sp)
+                                Text(protocolIcon(s.protocol), color = Blue, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                             }
                             Spacer(modifier = Modifier.width(11.dp))
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(s.name, color = text, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1)
                                 Text(s.protocol, color = muted, fontSize = 11.sp)
                             }
-                            Text(if (s.latency >= 0) "${s.latency} ms" else "-- ms", color = if (s.latency >= 0) Green else muted, fontSize = 11.sp)
+                            Column(horizontalAlignment = Alignment.End) {
+                                Text(if (s.latency >= 0) "${s.latency} ms" else "-- ms", color = if (s.latency >= 0) Green else muted, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                Text("TEST", color = Blue, fontSize = 9.sp, modifier = Modifier.clickable { onTestOne(i) }.padding(top = 2.dp))
+                            }
                             if (i == selected) { Spacer(modifier = Modifier.width(7.dp)); Text("✓", color = Green, fontSize = 20.sp) }
                         }
                     }
@@ -430,49 +563,55 @@ private fun protocolIcon(protocol: String): String = when (protocol.uppercase())
 }
 
 @Composable
-private fun SubscriptionScreen(darkMode: Boolean, url: String, onUrl: (String) -> Unit, updating: Boolean, message: String, serverCount: Int, onImport: () -> Unit, onTheme: () -> Unit, onBack: () -> Unit) {
+private fun SubscriptionScreen(
+    darkMode: Boolean,
+    url: String,
+    onUrl: (String) -> Unit,
+    updating: Boolean,
+    message: String,
+    serverCount: Int,
+    onImport: () -> Unit,
+    onTheme: () -> Unit,
+    onBack: () -> Unit
+) {
     val text = if (darkMode) Color.White else LightText
     val muted = if (darkMode) Muted else LightMuted
     val panel = if (darkMode) Panel else Color.White
-    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 14.dp)) {
+    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("‹", color = text, fontSize = 34.sp, modifier = Modifier.clickable { onBack() })
+            Text("‹", color = text, fontSize = 34.sp, modifier = Modifier.clickable(onClick = onBack))
             Spacer(modifier = Modifier.width(8.dp))
-            Column {
+            Column(modifier = Modifier.weight(1f)) {
                 Text("SUBSCRIPTION", color = text, fontSize = 25.sp, fontWeight = FontWeight.Bold)
-                Text("Link & appearance settings", color = muted, fontSize = 12.sp)
+                Text("Manage servers and appearance", color = muted, fontSize = 12.sp)
             }
         }
-        Spacer(modifier = Modifier.height(17.dp))
+        Spacer(modifier = Modifier.height(15.dp))
         Card(colors = CardDefaults.cardColors(panel), shape = RoundedCornerShape(19.dp), elevation = CardDefaults.cardElevation(if (darkMode) 0.dp else 2.dp)) {
             Column(modifier = Modifier.padding(16.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("🔗", fontSize = 24.sp)
-                    Spacer(modifier = Modifier.width(9.dp))
-                    Text("Subscription Link", color = text, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-                }
-                Spacer(modifier = Modifier.height(11.dp))
+                Text("Subscription Link", color = text, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(modifier = Modifier.height(10.dp))
                 OutlinedTextField(value = url, onValueChange = onUrl, modifier = Modifier.fillMaxWidth(), label = { Text("Paste subscription URL") }, placeholder = { Text("https://…") }, minLines = 2, maxLines = 3, shape = RoundedCornerShape(13.dp))
                 Spacer(modifier = Modifier.height(11.dp))
                 Button(onClick = onImport, modifier = Modifier.fillMaxWidth().height(50.dp), enabled = !updating, shape = RoundedCornerShape(13.dp)) {
                     Text(if (updating) "IMPORTING..." else "IMPORT SERVERS", fontWeight = FontWeight.Bold)
                 }
                 if (message.isNotBlank()) {
-                    Spacer(modifier = Modifier.height(10.dp))
+                    Spacer(modifier = Modifier.height(9.dp))
                     Text(message, color = if (message.contains("success", true)) Green else Blue, fontSize = 12.sp)
                 }
             }
         }
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(11.dp))
         Card(colors = CardDefaults.cardColors(panel), shape = RoundedCornerShape(17.dp)) {
             Column(modifier = Modifier.padding(15.dp)) {
                 Text("Current Subscription", color = text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(modifier = Modifier.height(5.dp))
-                Text(if (serverCount > 0) "●  Loaded • $serverCount servers" else "○  No subscription loaded", color = if (serverCount > 0) Green else muted, fontSize = 13.sp)
+                Text(if (serverCount > 0) "Loaded • $serverCount servers" else "No subscription loaded", color = if (serverCount > 0) Green else muted, fontSize = 13.sp)
             }
         }
         Spacer(modifier = Modifier.height(10.dp))
-        Card(modifier = Modifier.fillMaxWidth().clickable { onTheme() }, colors = CardDefaults.cardColors(panel), shape = RoundedCornerShape(17.dp)) {
+        Card(modifier = Modifier.fillMaxWidth().clickable(onClick = onTheme), colors = CardDefaults.cardColors(panel), shape = RoundedCornerShape(17.dp)) {
             Row(modifier = Modifier.padding(15.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(if (darkMode) "☀" else "☾", color = Blue, fontSize = 25.sp)
                 Spacer(modifier = Modifier.width(12.dp))
