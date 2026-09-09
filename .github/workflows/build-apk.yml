@@ -11,6 +11,8 @@ jobs:
     steps:
       - name: Checkout Bridge
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -39,8 +41,11 @@ jobs:
         run: |
           git show 135387de893ec0403991da76c23e65c03695f410:app/src/main/java/com/bridge/app/MainActivity.kt > app/src/main/java/com/bridge/app/MainActivity.kt
 
-      - name: Apply Bridge source enhancements
-        run: python3 tools/patch_main_activity.py
+      - name: Verify MainActivity baseline
+        run: |
+          grep -q 'class MainActivity : ComponentActivity' app/src/main/java/com/bridge/app/MainActivity.kt
+          grep -q 'data class ServerProfile' app/src/main/java/com/bridge/app/MainActivity.kt
+          grep -q 'object BridgeVpnState' app/src/main/java/com/bridge/app/BridgeVpnService.kt
 
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon
