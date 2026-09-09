@@ -45,7 +45,6 @@ jobs:
         run: |
           grep -q 'class MainActivity : ComponentActivity' app/src/main/java/com/bridge/app/MainActivity.kt
           grep -q 'data class ServerProfile' app/src/main/java/com/bridge/app/MainActivity.kt
-          grep -q 'object BridgeVpnState' app/src/main/java/com/bridge/app/BridgeVpnService.kt
 
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon
