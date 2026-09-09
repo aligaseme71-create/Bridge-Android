@@ -70,7 +70,7 @@ new_block = '''        if (testing) Text("Testing all servers...", color = Blue,
         ) {
             Text(if (testing) "PINGING..." else "PING ALL SERVERS", fontWeight = FontWeight.Bold)
         }
-        Spacer(modifier = Modifier.height(10.dp)
+        Spacer(modifier = Modifier.height(10.dp))
 '''
 if old_block in s:
     s = s.replace(old_block, new_block, 1)
