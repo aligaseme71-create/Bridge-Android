@@ -3,6 +3,15 @@ from pathlib import Path
 path = Path("app/src/main/java/com/bridge/app/MainActivity.kt")
 s = path.read_text(encoding="utf-8")
 
+# Android's VpnService lifecycle is designed around startService() after
+# VpnService.prepare() grants consent. The service promotes itself to the
+# foreground with startForeground() once started.
+s = s.replace(
+    "ContextCompat.startForegroundService(this, intent)",
+    "startService(intent)",
+    1,
+)
+
 if "import kotlinx.coroutines.async" not in s:
     s = s.replace(
         "import kotlinx.coroutines.Dispatchers\n",
@@ -61,7 +70,7 @@ new_block = '''        if (testing) Text("Testing all servers...", color = Blue,
         ) {
             Text(if (testing) "PINGING..." else "PING ALL SERVERS", fontWeight = FontWeight.Bold)
         }
-        Spacer(modifier = Modifier.height(10.dp))
+        Spacer(modifier = Modifier.height(10.dp)
 '''
 if old_block in s:
     s = s.replace(old_block, new_block, 1)
