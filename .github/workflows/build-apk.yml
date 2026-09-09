@@ -19,32 +19,21 @@ jobs:
           java-version: '17'
           cache: gradle
 
-      - name: Set up Go 1.27
-        uses: actions/setup-go@v6
-        with:
-          go-version: '1.27.x'
-          cache: false
-
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android build tools and NDK
+      - name: Install Android build tools
         run: |
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools" "ndk;29.0.14206865"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
 
-      - name: Build AndroidLibXrayLite AAR
+      - name: Download prebuilt AndroidLibXrayLite AAR
         run: |
-          git clone --depth 1 https://github.com/2dust/AndroidLibXrayLite.git /tmp/AndroidLibXrayLite
-          cd /tmp/AndroidLibXrayLite
-          go install golang.org/x/mobile/cmd/gomobile@latest
-          echo "$HOME/go/bin" >> "$GITHUB_PATH"
-          gomobile init
-          go mod tidy
-          gomobile bind -v -androidapi 24 -trimpath -ldflags='-s -w -buildid= -checklinkname=0' ./
           mkdir -p "$GITHUB_WORKSPACE/app/libs"
-          cp -v libv2ray.aar "$GITHUB_WORKSPACE/app/libs/libv2ray.aar"
+          curl -fL --retry 3 --retry-delay 2 \
+            -o "$GITHUB_WORKSPACE/app/libs/libv2ray.aar" \
+            "https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.7.19/libv2ray.aar"
+          ls -lh "$GITHUB_WORKSPACE/app/libs/libv2ray.aar"
 
       - name: Apply Bridge source enhancements
         run: python3 tools/patch_main_activity.py
