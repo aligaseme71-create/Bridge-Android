@@ -37,11 +37,15 @@ jobs:
             "https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.7.19/libv2ray.aar"
           ls -lh "$GITHUB_WORKSPACE/app/libs/libv2ray.aar"
 
+      - name: Apply Bridge connection fixes
+        run: python3 tools/apply_connect_fix.py
+
       - name: Verify Bridge sources
         run: |
           grep -q 'class MainActivity : ComponentActivity' app/src/main/java/com/bridge/app/MainActivity.kt
           grep -q 'data class ServerProfile' app/src/main/java/com/bridge/app/MainActivity.kt
           grep -q 'class BridgeVpnService : VpnService' app/src/main/java/com/bridge/app/BridgeVpnService.kt
+          grep -q 'excludeRoute(IpPrefix' app/src/main/java/com/bridge/app/BridgeVpnService.kt
 
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon
