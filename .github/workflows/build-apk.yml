@@ -45,7 +45,8 @@ jobs:
           grep -q 'class MainActivity : ComponentActivity' app/src/main/java/com/bridge/app/MainActivity.kt
           grep -q 'data class ServerProfile' app/src/main/java/com/bridge/app/MainActivity.kt
           grep -q 'class BridgeVpnService : VpnService' app/src/main/java/com/bridge/app/BridgeVpnService.kt
-          grep -q 'excludeRoute(IpPrefix' app/src/main/java/com/bridge/app/BridgeVpnService.kt
+          grep -q 'bindProcessToNetwork' app/src/main/java/com/bridge/app/BridgeVpnService.kt
+          grep -q 'fun extractServerHost' app/src/main/java/com/bridge/app/XrayConfigBuilder.kt
 
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon
