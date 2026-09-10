@@ -86,7 +86,6 @@ if old_power not in s:
     raise SystemExit('PowerButton block not found')
 s = s.replace(old_power, new_power)
 s = s.replace('Text(if (connected) "DISCONNECT" else "CONNECT", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)', 'Text(if (connected) "DISCONNECT" else if (testing) "CONNECTING..." else "CONNECT", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)')
-# testAll is declared after toggleConnection, so expose a deferred function reference before toggleConnection.
 s = s.replace('    val scope = rememberCoroutineScope()\n', '    val scope = rememberCoroutineScope()\n    var testAllFn: ((Boolean) -> Unit)? = null\n', 1)
 s = s.replace('''    fun testOne(index: Int) {''', '''    testAllFn = ::testAll
 
@@ -95,31 +94,71 @@ main.write_text(s)
 
 service = Path('app/src/main/java/com/bridge/app/BridgeVpnService.kt')
 s = service.read_text()
-s = s.replace('import android.net.VpnService\n', 'import android.net.VpnService\nimport android.net.IpPrefix\nimport java.net.Inet4Address\nimport java.net.Inet6Address\nimport java.net.InetAddress\n')
-old = '''                .apply {
-                    addDisallowedApplication(packageName)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) setMetered(false)
-                }'''
-new = '''                .apply {
-                    addDisallowedApplication(packageName)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        val upstreamHost = XrayConfigBuilder.extractServerHost(uri)
-                        if (!upstreamHost.isNullOrBlank()) {
-                            try {
-                                InetAddress.getAllByName(upstreamHost).forEach { address ->
-                                    val prefix = if (address is Inet4Address) 32 else 128
-                                    excludeRoute(IpPrefix(address, prefix))
-                                }
-                            } catch (e: Exception) {
-                                Log.w("BridgeVPN", "Could not resolve upstream for exclude route: $upstreamHost", e)
-                            }
-                        }
-                    }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) setMetered(false)
-                }'''
+s = s.replace('import android.net.VpnService\n', 'import android.net.VpnService\nimport android.net.ConnectivityManager\nimport android.net.IpPrefix\nimport android.net.Network\nimport java.net.Inet4Address\nimport java.net.Inet6Address\nimport java.net.InetAddress\n')
+s = s.replace('    private var stopping = false\n', '    private var stopping = false\n    private var boundNetwork: Network? = null\n', 1)
+old = '''            val config = XrayConfigBuilder.build(uri)
+            BridgeVpnState.message = "Starting Xray..."
+
+            vpnInterface = Builder()'''
+new = '''            val config = XrayConfigBuilder.build(uri)
+            BridgeVpnState.message = "Starting Xray..."
+
+            // Bind the process to the physical network BEFORE establishing the VPN.
+            // Android applies this binding to sockets created later by the embedded Xray core,
+            // keeping its upstream connection outside the VPN tunnel and preventing routing loops.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val cm = getSystemService(ConnectivityManager::class.java)
+                val network = cm.activeNetwork
+                if (network != null && cm.bindProcessToNetwork(network)) {
+                    boundNetwork = network
+                    Log.i("BridgeVPN", "Xray process bound to underlying network: $network")
+                } else {
+                    Log.w("BridgeVPN", "Could not bind Xray process to underlying network")
+                }
+            }
+
+            vpnInterface = Builder()'''
 if old not in s:
-    raise SystemExit('VPN builder block not found')
-s = s.replace(old, new)
+    raise SystemExit('config/builder block not found')
+s = s.replace(old, new, 1)
+old2 = '''            val pfd = vpnInterface ?: throw IllegalStateException("Android refused to create the VPN interface")
+
+            worker.execute {'''
+new2 = '''            val pfd = vpnInterface ?: throw IllegalStateException("Android refused to create the VPN interface")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                boundNetwork?.let { setUnderlyingNetworks(arrayOf(it)) }
+            }
+
+            worker.execute {'''
+if old2 not in s:
+    raise SystemExit('pfd block not found')
+s = s.replace(old2, new2, 1)
+old3 = '''    private fun fail(text: String) {
+        BridgeVpnState.connected = false
+        BridgeVpnState.message = text
+        Log.e("BridgeVPN", text)'''
+new3 = '''    private fun fail(text: String) {
+        BridgeVpnState.connected = false
+        BridgeVpnState.message = text
+        Log.e("BridgeVPN", text)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try { getSystemService(ConnectivityManager::class.java).bindProcessToNetwork(null) } catch (_: Exception) { }
+        }
+        boundNetwork = null'''
+if old3 not in s:
+    raise SystemExit('fail block not found')
+s = s.replace(old3, new3, 1)
+old4 = '''        try { controller?.stopLoop() } catch (_: Exception) { }
+        try { vpnInterface?.close() } catch (_: Exception) { }'''
+new4 = '''        try { controller?.stopLoop() } catch (_: Exception) { }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try { getSystemService(ConnectivityManager::class.java).bindProcessToNetwork(null) } catch (_: Exception) { }
+        }
+        boundNetwork = null
+        try { vpnInterface?.close() } catch (_: Exception) { }'''
+if old4 not in s:
+    raise SystemExit('stop block not found')
+s = s.replace(old4, new4, 1)
 service.write_text(s)
 
 builder = Path('app/src/main/java/com/bridge/app/XrayConfigBuilder.kt')
@@ -148,5 +187,6 @@ helper = '''object XrayConfigBuilder {
         } catch (_: Exception) { null }
     }
 '''
-s = s.replace(marker, helper, 1)
+if 'fun extractServerHost' not in s:
+    s = s.replace(marker, helper, 1)
 builder.write_text(s)
