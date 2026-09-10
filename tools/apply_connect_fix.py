@@ -33,7 +33,7 @@ new = '''    fun toggleConnection() {
                 tab = Tab.SUBSCRIPTION
                 message = "Add a subscription first."
             } else {
-                testAll(true)
+                testAllFn?.invoke(true)
             }
         }
     }'''
@@ -86,6 +86,11 @@ if old_power not in s:
     raise SystemExit('PowerButton block not found')
 s = s.replace(old_power, new_power)
 s = s.replace('Text(if (connected) "DISCONNECT" else "CONNECT", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)', 'Text(if (connected) "DISCONNECT" else if (testing) "CONNECTING..." else "CONNECT", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)')
+# testAll is declared after toggleConnection, so expose a deferred function reference before toggleConnection.
+s = s.replace('    val scope = rememberCoroutineScope()\n', '    val scope = rememberCoroutineScope()\n    var testAllFn: ((Boolean) -> Unit)? = null\n', 1)
+s = s.replace('''    fun testOne(index: Int) {''', '''    testAllFn = ::testAll
+
+    fun testOne(index: Int) {''', 1)
 main.write_text(s)
 
 service = Path('app/src/main/java/com/bridge/app/BridgeVpnService.kt')
