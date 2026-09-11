@@ -138,18 +138,18 @@ class BridgeVpnService : VpnService() {
                 ?: throw IllegalStateException("Android refused to create the VPN interface")
 
             setStage(BridgeVpnState.Stage.CONNECTING, "Starting Xray...")
-            @Volatile var xrayRunning = false
+            val xrayRunning = java.util.concurrent.atomic.AtomicBoolean(false)
             worker.execute {
                 try {
-                    xrayRunning = true
+                    xrayRunning.set(true)
                     core.startLoop(config, pfd.fd)
-                    xrayRunning = false
+                    xrayRunning.set(false)
                     Log.i(TAG, "startLoop returned")
                     if (!stopping && BridgeVpnState.stage != BridgeVpnState.Stage.CONNECTED) {
                         handler.post { setError("Xray core stopped unexpectedly") }
                     }
                 } catch (e: Exception) {
-                    xrayRunning = false
+                    xrayRunning.set(false)
                     Log.e(TAG, "startLoop failed", e)
                     if (!stopping) handler.post { setError("Connection failed: ${e.short()}") }
                 }
@@ -158,11 +158,11 @@ class BridgeVpnService : VpnService() {
             // Wait for Xray to begin, then give it 2.5s warm-up before probing.
             worker.execute {
                 val startWait = System.currentTimeMillis()
-                while (!xrayRunning && System.currentTimeMillis() - startWait < 3000) {
+                while (!xrayRunning.get() && System.currentTimeMillis() - startWait < 3000) {
                     try { Thread.sleep(100) } catch (_: InterruptedException) { return@execute }
                 }
                 try { Thread.sleep(2500) } catch (_: InterruptedException) { return@execute }
-                if (!stopping && xrayRunning) verifyConnection(core) { xrayRunning }
+                if (!stopping && xrayRunning.get()) verifyConnection(core) { xrayRunning.get() }
             }
 
         } catch (e: Exception) {
