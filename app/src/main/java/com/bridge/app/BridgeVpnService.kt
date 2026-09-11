@@ -20,41 +20,55 @@ import libv2ray.CoreController
 import libv2ray.Libv2ray
 import java.util.concurrent.Executors
 
+/**
+ * The Bridge VPN foreground service.
+ *
+ * Flow:
+ *   1. Android grants VPN permission (handled in MainActivity).
+ *   2. We build a full-tunnel TUN interface and hand its fd to Xray via
+ *      startLoop(config, fd). The bundled AndroidLibXrayLite reads packets
+ *      from that fd and routes them through the proxy outbound.
+ *   3. Xray's own outbound sockets are protected with VpnService.protect()
+ *      so they do NOT re-enter the tunnel (which would cause a routing loop).
+ *   4. We only report CONNECTED after measureDelay() proves real proxy
+ *      traffic works. Xray merely starting is NOT treated as connected.
+ */
 class BridgeVpnService : VpnService() {
+
     companion object {
         const val ACTION_CONNECT = "com.bridge.app.CONNECT"
         const val ACTION_DISCONNECT = "com.bridge.app.DISCONNECT"
         const val EXTRA_URI = "uri"
         private const val CHANNEL_ID = "bridge_vpn"
         private const val NOTIFICATION_ID = 1001
-        private const val CONNECT_TIMEOUT_MS = 15000L
+        private const val VERIFY_TIMEOUT_MS = 20000L
+        private const val TAG = "BRIDGE_VPN"
+        private const val PROBE_URL = "https://www.gstatic.com/generate_204"
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private var controller: CoreController? = null
     private var coreInitialized = false
-    private var stopping = false
+
+    @Volatile private var stopping = false
     private val handler = Handler(Looper.getMainLooper())
     private val worker = Executors.newCachedThreadPool()
 
     private val callback = object : CoreCallbackHandler {
+        // Xray started internally. We do NOT mark connected here — we wait for
+        // the proxy verification below.
         override fun startup(): Long {
-            if (!stopping) {
-                BridgeVpnState.connected = true
-                BridgeVpnState.message = "Connected"
-                handler.post { updateNotification("Bridge connected") }
-            }
+            Log.i(TAG, "Xray startup callback")
             return 0L
         }
 
         override fun shutdown(): Long {
-            BridgeVpnState.connected = false
-            BridgeVpnState.message = "Disconnected"
+            Log.i(TAG, "Xray shutdown callback")
             return 0L
         }
 
         override fun onEmitStatus(code: Long, text: String?): Long {
-            if (!text.isNullOrBlank()) BridgeVpnState.message = text
+            if (!text.isNullOrBlank()) Log.d("BRIDGE_XRAY", "status[$code]: $text")
             return 0L
         }
     }
@@ -69,15 +83,15 @@ class BridgeVpnService : VpnService() {
         if (coreInitialized && controller != null) return
         try {
             Seq.setContext(applicationContext)
-            Libv2ray.initCoreEnv(filesDir.absolutePath, "bridge")
+            Libv2ray.initCoreEnv(filesDir.absolutePath, "")
             controller = Libv2ray.newCoreController(callback)
             coreInitialized = true
-            BridgeVpnState.message = "Core ready"
+            Log.i(TAG, "Core initialized")
         } catch (e: Exception) {
             coreInitialized = false
             controller = null
-            BridgeVpnState.message = "Core init failed: ${e.message ?: e.javaClass.simpleName}"
-            Log.e("BridgeVPN", "Core init failed", e)
+            setError("Core init failed: ${e.short()}")
+            Log.e(TAG, "Core init failed", e)
         }
     }
 
@@ -90,91 +104,138 @@ class BridgeVpnService : VpnService() {
     }
 
     private fun startTunnel(uri: String) {
-        if (uri.isBlank()) {
-            fail("No server selected")
-            return
-        }
+        if (uri.isBlank()) { setError("No server selected"); return }
 
-        stopTunnel(false)
+        stopTunnel(stopService = false, quiet = true)
         initializeCore()
-        val core = controller
-        if (core == null) {
-            fail("VPN core is not available")
-            return
-        }
+        val core = controller ?: run { setError("VPN core is not available"); return }
 
         try {
             stopping = false
-            BridgeVpnState.connected = false
-            BridgeVpnState.message = "Preparing VPN..."
+            setStage(BridgeVpnState.Stage.CONNECTING, "Preparing VPN...")
             startBridgeForeground("Bridge is connecting")
 
-            val config = XrayConfigBuilder.build(uri)
-            BridgeVpnState.message = "Starting Xray..."
+            val config = XrayConfigBuilder.buildTunnel(uri)
+            Log.d("BRIDGE_CONFIG", "Config built (${config.length} bytes)")
 
+            setStage(BridgeVpnState.Stage.CONNECTING, "Creating tunnel...")
             vpnInterface = Builder()
                 .setSession("Bridge VPN")
                 .setMtu(1500)
                 .addAddress("10.0.0.2", 30)
                 .addRoute("0.0.0.0", 0)
+                .addRoute("::", 0)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
                 .apply {
-                    addDisallowedApplication(packageName)
+                    // Bridge itself must bypass the tunnel.
+                    try { addDisallowedApplication(packageName) } catch (_: Exception) {}
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) setMetered(false)
                 }
                 .establish()
 
-            val pfd = vpnInterface ?: throw IllegalStateException("Android refused to create the VPN interface")
+            val pfd = vpnInterface
+                ?: throw IllegalStateException("Android refused to create the VPN interface")
 
+            setStage(BridgeVpnState.Stage.CONNECTING, "Starting Xray...")
             worker.execute {
                 try {
+                    // startLoop blocks while the tunnel runs.
                     core.startLoop(config, pfd.fd)
-                    Log.i("BridgeVPN", "Xray startLoop returned")
-                    if (!stopping && !BridgeVpnState.connected) {
-                        handler.post { fail("Xray core stopped") }
+                    Log.i(TAG, "startLoop returned")
+                    if (!stopping && BridgeVpnState.stage != BridgeVpnState.Stage.CONNECTED) {
+                        handler.post { setError("Xray core stopped unexpectedly") }
                     }
                 } catch (e: Exception) {
-                    Log.e("BridgeVPN", "Xray connection failed", e)
-                    handler.post {
-                        if (!stopping) fail("Connection failed: ${e.message ?: e.javaClass.simpleName}")
-                    }
+                    Log.e(TAG, "startLoop failed", e)
+                    if (!stopping) handler.post { setError("Connection failed: ${e.short()}") }
                 }
             }
 
-            handler.postDelayed({
-                if (!stopping && !BridgeVpnState.connected) {
-                    fail("VPN startup timed out")
-                }
-            }, CONNECT_TIMEOUT_MS)
+            // Verify real proxy traffic on a separate thread.
+            worker.execute { verifyConnection(core) }
+
         } catch (e: Exception) {
-            Log.e("BridgeVPN", "Start failed", e)
-            try { core.stopLoop() } catch (_: Exception) { }
-            try { vpnInterface?.close() } catch (_: Exception) { }
+            Log.e(TAG, "start failed", e)
+            try { core.stopLoop() } catch (_: Exception) {}
+            try { vpnInterface?.close() } catch (_: Exception) {}
             vpnInterface = null
-            fail("Connection failed: ${e.message ?: e.javaClass.simpleName}")
+            setError("Connection failed: ${e.short()}")
         }
     }
 
-    private fun fail(text: String) {
-        BridgeVpnState.connected = false
-        BridgeVpnState.message = text
-        Log.e("BridgeVPN", text)
-        try { updateNotification(text) } catch (_: Exception) { }
-        try { controller?.stopLoop() } catch (_: Exception) { }
-        try { vpnInterface?.close() } catch (_: Exception) { }
-        vpnInterface = null
-        handler.postDelayed({ try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) { } }, 1000L)
+    /**
+     * Poll measureDelay until it succeeds or we time out. Only then do we
+     * report CONNECTED. This is what makes the green state MEAN something.
+     */
+    private fun verifyConnection(core: CoreController) {
+        val deadline = System.currentTimeMillis() + VERIFY_TIMEOUT_MS
+        var attempt = 0
+        while (!stopping && System.currentTimeMillis() < deadline) {
+            attempt++
+            try {
+                val delay = core.measureDelay(PROBE_URL)
+                if (delay in 0..8000) {
+                    if (!stopping) {
+                        BridgeVpnState.latencyMs = delay
+                        setStage(BridgeVpnState.Stage.CONNECTED, "Connected")
+                        handler.post { updateNotification("Bridge connected • ${delay} ms") }
+                    }
+                    return
+                }
+            } catch (e: Exception) {
+                Log.d(TAG, "verify attempt $attempt: ${e.short()}")
+            }
+            try { Thread.sleep(1500) } catch (_: InterruptedException) { return }
+        }
+        if (!stopping && BridgeVpnState.stage != BridgeVpnState.Stage.CONNECTED) {
+            handler.post { setError("VPN started but proxy traffic failed") }
+        }
     }
 
-    private fun stopTunnel(stopService: Boolean = true) {
-        stopping = true
-        try { controller?.stopLoop() } catch (_: Exception) { }
-        try { vpnInterface?.close() } catch (_: Exception) { }
+    /**
+     * NOTE ON ROUTING LOOP:
+     * Because we call addDisallowedApplication(packageName) on the tunnel
+     * Builder, the entire Bridge process is excluded from the VPN. Xray runs
+     * inside that same process, so its outbound sockets to the proxy server
+     * automatically bypass the tunnel. That prevents the recursive
+     * "Xray traffic re-enters its own tunnel" loop WITHOUT needing
+     * bindProcessToNetwork (which caused instability in earlier versions).
+     */
+
+    private fun setStage(stage: BridgeVpnState.Stage, message: String) {
+        BridgeVpnState.stage = stage
+        BridgeVpnState.message = message
+        Log.i(TAG, "stage=$stage msg=$message")
+    }
+
+    private fun setError(text: String) {
+        BridgeVpnState.stage = BridgeVpnState.Stage.ERROR
+        BridgeVpnState.message = text
+        BridgeVpnState.latencyMs = -1L
+        Log.e(TAG, "ERROR: $text")
+        try { updateNotification(text) } catch (_: Exception) {}
+        try { controller?.stopLoop() } catch (_: Exception) {}
+        try { vpnInterface?.close() } catch (_: Exception) {}
         vpnInterface = null
-        BridgeVpnState.connected = false
-        BridgeVpnState.message = "Disconnected"
-        try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) { }
+        handler.postDelayed({
+            if (BridgeVpnState.stage == BridgeVpnState.Stage.ERROR) {
+                BridgeVpnState.reset()
+            }
+            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
+        }, 1500L)
+    }
+
+    private fun stopTunnel(stopService: Boolean = true, quiet: Boolean = false) {
+        stopping = true
+        if (!quiet) setStage(BridgeVpnState.Stage.DISCONNECTING, "Disconnecting...")
+        try { controller?.stopLoop() } catch (_: Exception) {}
+        try { vpnInterface?.close() } catch (_: Exception) {}
+        vpnInterface = null
+        if (!quiet) {
+            BridgeVpnState.reset()
+            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
+        }
         if (stopService) stopSelf()
     }
 
@@ -184,7 +245,7 @@ class BridgeVpnService : VpnService() {
     }
 
     override fun onDestroy() {
-        stopTunnel(false)
+        stopTunnel(stopService = false)
         controller = null
         coreInitialized = false
         worker.shutdownNow()
@@ -227,4 +288,6 @@ class BridgeVpnService : VpnService() {
     private fun updateNotification(text: String) {
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(text))
     }
+
+    private fun Exception.short(): String = message ?: javaClass.simpleName
 }

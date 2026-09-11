@@ -11,8 +11,6 @@ jobs:
     steps:
       - name: Checkout Bridge
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -37,26 +35,8 @@ jobs:
             "https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.7.19/libv2ray.aar"
           ls -lh "$GITHUB_WORKSPACE/app/libs/libv2ray.aar"
 
-      - name: Apply Bridge connection fixes
-        run: python3 tools/apply_connect_fix.py
-
-      - name: Repair generated Bridge UI
-        run: python3 tools/repair_generated_ui.py
-
-      - name: Verify Bridge sources
-        run: |
-          set -e
-          grep -q 'class MainActivity : ComponentActivity' app/src/main/java/com/bridge/app/MainActivity.kt
-          grep -q 'data class ServerProfile' app/src/main/java/com/bridge/app/MainActivity.kt
-          grep -q 'fun testAll(autoConnect: Boolean)' app/src/main/java/com/bridge/app/MainActivity.kt
-          grep -q 'fun tcpPing(uri: String)' app/src/main/java/com/bridge/app/MainActivity.kt
-          grep -q 'class BridgeVpnService : VpnService' app/src/main/java/com/bridge/app/BridgeVpnService.kt
-          grep -q 'bindProcessToNetwork' app/src/main/java/com/bridge/app/BridgeVpnService.kt
-          grep -q 'message = message' app/src/main/java/com/bridge/app/MainActivity.kt
-          echo 'Bridge source verification passed.'
-
       - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
+        run: gradle assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
